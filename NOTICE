@@ -1,0 +1,11 @@
+Velum source code is licensed under GPL-3.0-or-later.
+
+sing-box is an independent external executable, pinned to v1.12.12.
+Source: https://github.com/SagerNet/sing-box/tree/v1.12.12
+Its license and additional name/association condition are retained in:
+https://github.com/SagerNet/sing-box/blob/v1.12.12/LICENSE
+When distributing binaries, include dependency notices and provide corresponding
+source and build instructions as required by their licenses. The local bin/
+folder is ignored by Git. Flutter-generated runner code and bundled dependencies
+retain their respective notices.
+Velum is not affiliated with INCY or SagerNet.

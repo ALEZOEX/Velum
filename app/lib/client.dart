@@ -1,0 +1,1124 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+
+import 'imports.dart';
+import 'models.dart';
+export 'models.dart';
+
+const defaultSettings = <String, dynamic>{
+  'theme': 'system',
+  'mode': 'proxy',
+  'mtu': 1400,
+  'ipv6': true,
+  'dns': 'https://1.1.1.1/dns-query',
+  'directDns': 'local',
+  'routeMode': 'global',
+  'rules': <Map<String, dynamic>>[],
+  'fragment': false,
+  'reconnect': false,
+  'proxyPort': 2080,
+  'interface': '',
+  'autoConnect': false,
+  'autostart': false,
+  'minimizeToTray': true,
+  'systemProxy': false,
+};
+const _networkKeys = {
+  'mode',
+  'mtu',
+  'ipv6',
+  'dns',
+  'directDns',
+  'routeMode',
+  'rules',
+  'fragment',
+  'reconnect',
+  'proxyPort',
+  'interface',
+};
+
+class VelumClient extends ChangeNotifier {
+  VelumClient({Directory? directory, Uri? apiBase})
+    : directory =
+          directory ??
+          Directory(
+            '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
+          ),
+      apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
+  final Directory directory;
+  final Uri apiBase;
+  final List<Profile> profiles = [];
+  final List<Subscription> subscriptions = [];
+  final Set<String> updatingSubscriptions = {};
+  final List<Map<String, dynamic>> logs = [];
+  Map<String, dynamic> settings = Map<String, dynamic>.from(defaultSettings);
+  Map<String, dynamic> status = {};
+  int selected = 0;
+  String exclusions = '';
+  String state = 'offline';
+  String mode = '';
+  String message = '';
+  bool busy = false;
+  bool pinging = false;
+  Timer? _timer;
+  Timer? _subscriptionTimer;
+  bool _disposed = false;
+  bool _polling = false;
+  String _token = '';
+  String _storageError = '';
+  Future<void> _writes = Future<void>.value();
+  File get _file => File('${directory.path}/profiles.json');
+  bool get verified => status['verified'] == true;
+  int? get latencyMs => status['latencyMs'] as int?;
+  int get uptimeSeconds => status['uptimeSeconds'] as int? ?? 0;
+  DateTime? get connectedAt =>
+      DateTime.tryParse(status['connectedAt'] as String? ?? '');
+  int? get uploadTotal => status['uploadTotal'] as int?;
+  int? get downloadTotal => status['downloadTotal'] as int?;
+  int? get uploadRate => status['uploadRate'] as int?;
+  int? get downloadRate => status['downloadRate'] as int?;
+  String get activeProfile => status['activeProfile'] as String? ?? '';
+  int indexOf(Profile profile) => profiles.indexWhere(
+    (p) => p.id == profile.id && p.subscriptionId == profile.subscriptionId,
+  );
+  @override
+  void notifyListeners() {
+    if (!_disposed) {
+      super.notifyListeners();
+    }
+  }
+
+  Future<void> initialize() async {
+    try {
+      await _prepareDirectory();
+      if (await _file.exists()) {
+        final bytes = await _file.readAsBytes();
+        if (bytes.length > 4 * maxImportBytes) {
+          throw const FormatException('Файл профилей слишком большой.');
+        }
+        final document = _validatedDocument(jsonDecode(utf8.decode(bytes)));
+        _applyDocument(document);
+        if (document['migrated'] == true) {
+          final original = File('${directory.path}/profiles.v1.backup.json');
+          if (!await original.exists()) {
+            await _privateWrite(original, bytes);
+          }
+          await _save();
+        }
+      }
+    } on FormatException catch (error) {
+      message = error.message;
+      _storageError = error.message;
+    } catch (_) {
+      message =
+          'Не удалось прочитать локальные профили. Проверьте каталог Velum.';
+      _storageError = message;
+    }
+    try {
+      _token = (await File('${directory.path}/token').readAsString()).trim();
+    } catch (_) {
+      if (message.isEmpty) {
+        message = 'Служба ещё не настроена. Выполните scripts/init-client.py.';
+      }
+    }
+    await refresh();
+    _timer?.cancel();
+    _subscriptionTimer?.cancel();
+    _timer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => unawaited(refresh()),
+    );
+    _subscriptionTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => unawaited(_updateDueSubscriptions()),
+    );
+    if (settings['autoConnect'] == true &&
+        state == 'disconnected' &&
+        profiles.isNotEmpty) {
+      await reconnect();
+    }
+    notifyListeners();
+  }
+
+  List<Profile> filteredProfiles({
+    String query = '',
+    String? subscriptionId,
+    bool favoritesOnly = false,
+    String sort = 'name',
+  }) {
+    final needle = query.toLowerCase().trim();
+    final result = profiles
+        .where(
+          (p) =>
+              (subscriptionId == null || p.subscriptionId == subscriptionId) &&
+              (!favoritesOnly || p.favorite) &&
+              (needle.isEmpty ||
+                  '${p.name} ${p.server} ${p.protocol}'.toLowerCase().contains(
+                    needle,
+                  )),
+        )
+        .toList();
+    switch (sort) {
+      case 'latency':
+        result.sort(
+          (a, b) => (a.latencyMs ?? 1 << 30).compareTo(b.latencyMs ?? 1 << 30),
+        );
+      case 'protocol':
+        result.sort(
+          (a, b) =>
+              '${a.protocol} ${a.name}'.compareTo('${b.protocol} ${b.name}'),
+        );
+      case 'original':
+        break;
+      default:
+        result.sort(
+          (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+        );
+    }
+    return result;
+  }
+
+  Future<void> importText(String text, {String? title}) async {
+    if (utf8.encode(text).length > maxImportBytes) {
+      throw const FormatException('Данные больше 1 МБ.');
+    }
+    final payload = unwrapImport(text);
+    final source = Uri.tryParse(payload);
+    if (source?.scheme == 'https' &&
+        source!.userInfo.isEmpty &&
+        !(source.hasPort && source.fragment.isNotEmpty)) {
+      final id = 'sub-${stableId(payload)}';
+      final existing = subscriptions.where((s) => s.id == id).firstOrNull;
+      final initial =
+          existing ??
+          Subscription(
+            id: id,
+            url: payload,
+            title: _cleanTitle(title ?? source.host),
+          );
+      final fetched = await _fetchSubscription(initial);
+      await _mutate(() {
+        final index = subscriptions.indexWhere((s) => s.id == id);
+        if (index < 0) {
+          if (subscriptions.length >= 100) {
+            throw const FormatException('Лимит — 100 подписок.');
+          }
+          subscriptions.add(fetched.subscription);
+        } else {
+          subscriptions[index] = fetched.subscription;
+        }
+        _replaceSubscriptionProfiles(id, fetched.profiles);
+      });
+    } else {
+      final parsed = parseSubscriptionBody(payload);
+      await _mutate(() {
+        final identities = profiles
+            .where((p) => p.subscriptionId == null)
+            .map((p) => profileIdentity(p.uri))
+            .toSet();
+        profiles.addAll(
+          parsed.where((p) => identities.add(profileIdentity(p.uri))),
+        );
+        if (profiles.length > maxProfiles) {
+          throw const FormatException('Лимит — 500 профилей.');
+        }
+      });
+    }
+    message = '';
+    notifyListeners();
+  }
+
+  Future<({Subscription subscription, List<Profile> profiles})>
+  _fetchSubscription(Subscription subscription) async {
+    final source = Uri.parse(subscription.url);
+    if (source.scheme != 'https' ||
+        source.host.isEmpty ||
+        source.userInfo.isNotEmpty) {
+      throw const FormatException(
+        'Для подписки нужен HTTPS URL без встроенного пароля.',
+      );
+    }
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client
+          .getUrl(source)
+          .timeout(const Duration(seconds: 10));
+      request.followRedirects = false;
+      request.headers.set(HttpHeaders.userAgentHeader, subscription.userAgent);
+      final response = await request.close().timeout(
+        const Duration(seconds: 10),
+      );
+      if (response.statusCode != 200) {
+        throw FormatException(
+          'Подписка вернула HTTP ${response.statusCode}; перенаправления отключены.',
+        );
+      }
+      final bytes = <int>[];
+      await for (final chunk in response.timeout(const Duration(seconds: 10))) {
+        bytes.addAll(chunk);
+        if (bytes.length > maxImportBytes) {
+          throw const FormatException('Подписка больше 1 МБ.');
+        }
+      }
+      final parsed = parseSubscriptionBody(
+        utf8.decode(bytes),
+        subscriptionId: subscription.id,
+      );
+      String? header(String name) => response.headers.value(name);
+      final info = <String, int>{};
+      for (final part in (header('subscription-userinfo') ?? '').split(';')) {
+        final pair = part.trim().split('=');
+        if (pair.length == 2) {
+          final value = int.tryParse(pair[1].trim());
+          if (value != null && value >= 0) {
+            info[pair[0].trim()] = value;
+          }
+        }
+      }
+      var name = header('profile-title');
+      if (name?.startsWith('base64:') == true) {
+        try {
+          name = utf8.decode(
+            base64.decode(base64.normalize(name!.substring(7))),
+          );
+        } catch (_) {
+          name = null;
+        }
+      }
+      final expiration = info['expire'];
+      final expires =
+          expiration != null && expiration > 0 && expiration < 253402300799
+          ? DateTime.fromMillisecondsSinceEpoch(expiration * 1000, isUtc: true)
+          : null;
+      return (
+        subscription: subscription.copyWith(
+          title:
+              subscription.lastUpdated != null || name == null || name.isEmpty
+              ? subscription.title
+              : _cleanTitle(name),
+          lastUpdated: DateTime.now().toUtc(),
+          upload: info['upload'],
+          download: info['download'],
+          total: info['total'],
+          expires: expires,
+          error: '',
+          supportUrl: _safeWebUrl(header('support-url')),
+          webpageUrl: _safeWebUrl(header('profile-web-page-url')),
+        ),
+        profiles: parsed,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  String? _safeWebUrl(String? value) {
+    if (value == null || value.length > 4096) {
+      return null;
+    }
+    final uri = Uri.tryParse(value);
+    return uri != null &&
+            uri.scheme == 'https' &&
+            uri.host.isNotEmpty &&
+            uri.userInfo.isEmpty
+        ? value
+        : null;
+  }
+
+  void _replaceSubscriptionProfiles(String id, List<Profile> replacements) {
+    final chosen = profiles.isEmpty ? null : profiles[selected].id;
+    final previous = {
+      for (final p in profiles.where((p) => p.subscriptionId == id))
+        profileIdentity(p.uri): p,
+    };
+    final next = replacements.map((p) {
+      final old = previous[profileIdentity(p.uri)];
+      return old == null
+          ? p
+          : p.copyWith(
+              id: old.id,
+              name: old.customName ? old.name : p.name,
+              customName: old.customName,
+              favorite: old.favorite,
+              latencyMs: old.latencyMs,
+              lastChecked: old.lastChecked,
+            );
+    }).toList();
+    final insertion = profiles.indexWhere((p) => p.subscriptionId == id);
+    profiles.removeWhere((p) => p.subscriptionId == id);
+    if (profiles.length + next.length > maxProfiles) {
+      throw const FormatException('Лимит — 500 профилей.');
+    }
+    profiles.insertAll(
+      insertion < 0 || insertion > profiles.length
+          ? profiles.length
+          : insertion,
+      next,
+    );
+    final nextIndex = profiles.indexWhere((p) => p.id == chosen);
+    selected = nextIndex < 0 ? 0 : nextIndex;
+  }
+
+  Future<void> updateSubscription(String id) async {
+    if (updatingSubscriptions.contains(id)) {
+      return;
+    }
+    final initial = subscriptions.where((s) => s.id == id).firstOrNull;
+    if (initial == null) {
+      return;
+    }
+    updatingSubscriptions.add(id);
+    notifyListeners();
+    try {
+      final fetched = await _fetchSubscription(initial);
+      await _mutate(() {
+        final index = subscriptions.indexWhere((s) => s.id == id);
+        if (index < 0) {
+          return;
+        }
+        subscriptions[index] = fetched.subscription;
+        _replaceSubscriptionProfiles(id, fetched.profiles);
+      });
+    } catch (error) {
+      final text = error is FormatException
+          ? error.message
+          : 'Не удалось загрузить подписку. Сохранённые серверы оставлены.';
+      await _mutate(() {
+        final index = subscriptions.indexWhere((s) => s.id == id);
+        if (index >= 0) {
+          subscriptions[index] = subscriptions[index].copyWith(error: text);
+        }
+      });
+      message = text;
+      rethrow;
+    } finally {
+      updatingSubscriptions.remove(id);
+      notifyListeners();
+    }
+  }
+
+  Future<void> updateAllSubscriptions() async {
+    var failures = 0;
+    for (final id in subscriptions.map((s) => s.id).toList()) {
+      try {
+        await updateSubscription(id);
+      } catch (_) {
+        failures++;
+      }
+    }
+    if (failures > 0) {
+      message =
+          'Не удалось обновить подписок: $failures. Сохранённые серверы оставлены.';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _updateDueSubscriptions() async {
+    if (_disposed) {
+      return;
+    }
+    final now = DateTime.now();
+    for (final sub in List<Subscription>.of(subscriptions)) {
+      if (sub.autoUpdate &&
+          (sub.lastUpdated == null ||
+              now.difference(sub.lastUpdated!).inMinutes >=
+                  sub.intervalMinutes)) {
+        try {
+          await updateSubscription(sub.id);
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> configureSubscription(
+    String id, {
+    String? title,
+    String? userAgent,
+    bool? autoUpdate,
+    int? intervalMinutes,
+  }) async {
+    if (userAgent != null &&
+        (userAgent.length > 256 || userAgent.contains(RegExp(r'[\r\n]')))) {
+      throw const FormatException(
+        'User-Agent: не более 256 символов без переносов.',
+      );
+    }
+    if (intervalMinutes != null &&
+        (intervalMinutes < 15 || intervalMinutes > 10080)) {
+      throw const FormatException(
+        'Интервал обновления — от 15 минут до 7 дней.',
+      );
+    }
+    await _mutate(() {
+      final index = subscriptions.indexWhere((s) => s.id == id);
+      if (index >= 0) {
+        subscriptions[index] = subscriptions[index].copyWith(
+          title: title == null ? null : _cleanTitle(title),
+          userAgent: userAgent,
+          autoUpdate: autoUpdate,
+          intervalMinutes: intervalMinutes,
+        );
+      }
+    });
+  }
+
+  Future<void> removeSubscription(String id) async => _mutate(() {
+    subscriptions.removeWhere((s) => s.id == id);
+    final chosen = profiles.isEmpty ? null : profiles[selected].id;
+    profiles.removeWhere((p) => p.subscriptionId == id);
+    final nextIndex = profiles.indexWhere((p) => p.id == chosen);
+    selected = nextIndex < 0 ? 0 : nextIndex;
+  });
+
+  int _existingProfile(String id) {
+    final index = profiles.indexWhere((profile) => profile.id == id);
+    if (index < 0) {
+      throw StateError('Профиль уже удалён или обновлён.');
+    }
+    return index;
+  }
+
+  Future<void> select(int index) async {
+    RangeError.checkValidIndex(index, profiles);
+    final id = profiles[index].id;
+    await _mutate(() {
+      selected = _existingProfile(id);
+    });
+  }
+
+  Future<void> remove(int index) async {
+    RangeError.checkValidIndex(index, profiles);
+    final id = profiles[index].id;
+    await _mutate(() {
+      final chosen = profiles[selected].id;
+      profiles.removeAt(_existingProfile(id));
+      final nextIndex = profiles.indexWhere((p) => p.id == chosen);
+      selected = nextIndex < 0 ? 0 : nextIndex;
+    });
+  }
+
+  Future<void> toggleFavorite(int index) async {
+    RangeError.checkValidIndex(index, profiles);
+    final id = profiles[index].id;
+    await _mutate(() {
+      final current = _existingProfile(id);
+      profiles[current] = profiles[current].copyWith(
+        favorite: !profiles[current].favorite,
+      );
+    });
+  }
+
+  Future<void> rename(int index, String name) async {
+    RangeError.checkValidIndex(index, profiles);
+    final id = profiles[index].id;
+    final clean = _cleanTitle(name);
+    await _mutate(() {
+      final current = _existingProfile(id);
+      profiles[current] = profiles[current].copyWith(
+        name: clean,
+        customName: true,
+      );
+    });
+  }
+
+  Future<void> edit(int index, String uri, String name) async {
+    RangeError.checkValidIndex(index, profiles);
+    final old = profiles[index];
+    final parsed = parseProfile(uri, subscriptionId: old.subscriptionId);
+    final clean = _cleanTitle(name);
+    await _mutate(() {
+      final current = _existingProfile(old.id);
+      profiles[current] = parsed.copyWith(
+        id: old.id,
+        name: clean,
+        customName: true,
+        favorite: profiles[current].favorite,
+      );
+    });
+  }
+
+  String exportProfile(int index) {
+    RangeError.checkValidIndex(index, profiles);
+    final profile = profiles[index];
+    if (Uri.parse(profile.uri).scheme == 'vmess') {
+      final data = jsonDecode(
+        utf8.decode(base64.decode(base64.normalize(profile.uri.substring(8)))),
+      ) as Map<String, dynamic>;
+      data['ps'] = profile.name;
+      return 'vmess://${base64.encode(utf8.encode(jsonEncode(data)))}';
+    }
+    return Uri.parse(profile.uri).replace(fragment: profile.name).toString();
+  }
+
+  Future<void> saveExclusions(String value) async {
+    if (value.length > 16384) {
+      throw const FormatException('Слишком много исключений.');
+    }
+    await _mutate(() {
+      exclusions = value;
+    });
+  }
+
+  Future<void> pingProfiles([List<int>? indices]) async {
+    if (pinging) {
+      return;
+    }
+    final ids = (indices ?? List<int>.generate(profiles.length, (i) => i))
+        .where((i) => i >= 0 && i < profiles.length)
+        .map((i) => profiles[i].id)
+        .toList();
+    pinging = true;
+    notifyListeners();
+    var cursor = 0;
+    Future<void> worker() async {
+      while (cursor < ids.length && !_disposed) {
+        final id = ids[cursor++];
+        final profile = profiles.where((p) => p.id == id).firstOrNull;
+        if (profile == null) {
+          continue;
+        }
+        int? ms;
+        if (['hy2', 'hysteria2'].contains(Uri.parse(profile.uri).scheme)) {
+          final index = profiles.indexWhere((p) => p.id == id);
+          if (index >= 0) {
+            profiles[index] = profiles[index].copyWith(clearLatency: true);
+          }
+          continue;
+        }
+        try {
+          final result = await _request('probe', {'uri': profile.uri});
+          if (result['ok'] == true && result['latencyMs'] is int) {
+            ms = result['latencyMs'] as int;
+          }
+        } catch (_) {
+          final watch = Stopwatch()..start();
+          try {
+            final socket = await Socket.connect(
+              profile.server,
+              profile.port,
+              timeout: const Duration(seconds: 3),
+            );
+            ms = watch.elapsedMilliseconds;
+            socket.destroy();
+          } catch (_) {
+            ms = null;
+          }
+        }
+        final index = profiles.indexWhere((p) => p.id == id);
+        if (index >= 0) {
+          profiles[index] = profiles[index].copyWith(
+            latencyMs: ms,
+            clearLatency: ms == null,
+            lastChecked: DateTime.now().toUtc(),
+          );
+          notifyListeners();
+        }
+      }
+    }
+
+    try {
+      await Future.wait(List.generate(min(4, ids.length), (_) => worker()));
+      await _mutate(() {});
+    } finally {
+      pinging = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> saveSettings(Map<String, dynamic> value) async {
+    final validated = _validateSettings({...settings, ...value});
+    await _mutate(() {
+      settings = validated;
+    });
+  }
+
+  String exportBackup() =>
+      const JsonEncoder.withIndent('  ')
+          .convert({'format': 'velum-backup', ..._document()});
+  Future<void> restoreBackup(String source) async {
+    if (utf8.encode(source).length > 4 * maxImportBytes) {
+      throw const FormatException('Резервная копия больше 4 МБ.');
+    }
+    final decoded = jsonDecode(source);
+    if (decoded is! Map || decoded['format'] != 'velum-backup') {
+      throw const FormatException('Это не резервная копия Velum.');
+    }
+    final document = _validatedDocument(decoded);
+    await _mutate(() {
+      _applyDocument(document);
+    }, allowRecovery: true);
+    _storageError = '';
+  }
+
+  Future<void> _prepareDirectory() async {
+    await directory.create(recursive: true);
+    if (Platform.isLinux || Platform.isMacOS) {
+      final result = await Process.run('chmod', ['700', directory.path]);
+      if (result.exitCode != 0) {
+        throw const FileSystemException(
+          'Не удалось ограничить доступ к каталогу Velum.',
+        );
+      }
+    }
+  }
+
+  Future<void> _privateWrite(File target, List<int> bytes) async {
+    final handle = await target.open(mode: FileMode.write);
+    try {
+      if (Platform.isLinux || Platform.isMacOS) {
+        final result = await Process.run('chmod', ['600', target.path]);
+        if (result.exitCode != 0) {
+          throw const FileSystemException('Не удалось защитить файл Velum.');
+        }
+      }
+      await handle.writeFrom(bytes);
+      await handle.flush();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  Map<String, dynamic> _document() => {
+    'version': 2,
+    'profiles': profiles.map((p) => p.toJson()).toList(),
+    'subscriptions': subscriptions.map((s) => s.toJson()).toList(),
+    'selected': selected,
+    'exclusions': exclusions,
+    'settings': settings,
+  };
+  Future<void> _save() async {
+    await _prepareDirectory();
+    final tmp = File('${_file.path}.${Random.secure().nextInt(1 << 32)}.tmp');
+    try {
+      await _privateWrite(tmp, utf8.encode(jsonEncode(_document())));
+      await tmp.rename(_file.path);
+    } finally {
+      if (await tmp.exists()) {
+        await tmp.delete();
+      }
+    }
+  }
+
+  Future<void> _mutate(void Function() change, {bool allowRecovery = false}) {
+    final result = _writes.then((_) async {
+      if (_storageError.isNotEmpty && !allowRecovery) {
+        throw const FormatException(
+          'Исходный файл профилей не загружен. Восстановите проверенную резервную копию перед изменениями.',
+        );
+      }
+      final previous = jsonDecode(jsonEncode(_document()));
+      try {
+        change();
+        await _save();
+      } catch (_) {
+        _applyDocument(_validatedDocument(previous));
+        rethrow;
+      }
+      notifyListeners();
+    });
+    _writes = result.catchError((Object _) {});
+    return result;
+  }
+
+  String _cleanTitle(String value) {
+    final clean = value.trim();
+    if (clean.isEmpty ||
+        clean.length > 200 ||
+        clean.contains(RegExp(r'[\r\n\x00]'))) {
+      throw const FormatException('Имя: от 1 до 200 символов без переносов.');
+    }
+    return clean;
+  }
+
+  Map<String, dynamic> _validatedDocument(dynamic raw) {
+    if (raw is! Map<String, dynamic>) {
+      throw const FormatException('Некорректный файл профилей.');
+    }
+    final version = raw['version'];
+    if (version != null && version != 1 && version != 2) {
+      throw const FormatException('Версия файла профилей не поддерживается.');
+    }
+    final rows = raw['profiles'];
+    if (rows is! List || rows.length > maxProfiles) {
+      throw const FormatException('Некорректный список серверов.');
+    }
+    final subRows = raw['subscriptions'] ?? [];
+    if (subRows is! List || subRows.length > 100) {
+      throw const FormatException('Некорректный список подписок.');
+    }
+    final subs = <Subscription>[];
+    final subIds = <String>{};
+    for (final row in subRows) {
+      if (row is! Map<String, dynamic> ||
+          row['id'] is! String ||
+          row['url'] is! String ||
+          row['title'] is! String) {
+        throw const FormatException('Некорректная подписка.');
+      }
+      final uri = Uri.tryParse(row['url'] as String);
+      if (uri == null ||
+          uri.scheme != 'https' ||
+          uri.host.isEmpty ||
+          uri.userInfo.isNotEmpty ||
+          !subIds.add(row['id'] as String)) {
+        throw const FormatException(
+          'Некорректный URL или идентификатор подписки.',
+        );
+      }
+      final minutes = row['intervalMinutes'] ?? 360;
+      final ua = row['userAgent'] ?? 'Velum/0.2';
+      if (minutes is! int ||
+          minutes < 15 ||
+          minutes > 10080 ||
+          ua is! String ||
+          ua.length > 256 ||
+          ua.contains(RegExp(r'[\r\n]')) ||
+          (row['autoUpdate'] != null && row['autoUpdate'] is! bool)) {
+        throw const FormatException('Некорректные параметры подписки.');
+      }
+      int? number(String key) {
+        final v = row[key];
+        if (v != null && (v is! int || v < 0)) {
+          throw const FormatException('Некорректная статистика подписки.');
+        }
+        return v as int?;
+      }
+
+      DateTime? date(String key) {
+        final v = row[key];
+        if (v == null) {
+          return null;
+        }
+        if (v is! String || DateTime.tryParse(v) == null) {
+          throw const FormatException('Некорректная дата.');
+        }
+        return DateTime.parse(v);
+      }
+
+      subs.add(
+        Subscription(
+          id: row['id'] as String,
+          url: row['url'] as String,
+          title: _cleanTitle(row['title'] as String),
+          userAgent: ua,
+          autoUpdate: row['autoUpdate'] as bool? ?? false,
+          intervalMinutes: minutes,
+          lastUpdated: date('lastUpdated'),
+          upload: number('upload'),
+          download: number('download'),
+          total: number('total'),
+          expires: date('expires'),
+          error: row['error'] is String ? row['error'] as String : '',
+          supportUrl: row['supportUrl'] is String
+              ? _safeWebUrl(row['supportUrl'] as String)
+              : null,
+          webpageUrl: row['webpageUrl'] is String
+              ? _safeWebUrl(row['webpageUrl'] as String)
+              : null,
+        ),
+      );
+    }
+    final parsed = <Profile>[];
+    final ids = <String>{};
+    for (final row in rows) {
+      if (row is! Map<String, dynamic> || row['uri'] is! String) {
+        throw const FormatException('Некорректный сервер в файле.');
+      }
+      final subId = row['subscriptionId'];
+      if (subId != null && (subId is! String || !subIds.contains(subId))) {
+        throw const FormatException(
+          'Сервер ссылается на неизвестную подписку.',
+        );
+      }
+      var profile = parseProfile(
+        row['uri'] as String,
+        subscriptionId: subId as String?,
+      );
+      var id = row['id'] is String && (row['id'] as String).isNotEmpty
+          ? row['id'] as String
+          : profile.id;
+      if (id.length > 100) {
+        throw const FormatException('Некорректный идентификатор сервера.');
+      }
+      if (!ids.add(id)) {
+        if (version == 2) {
+          throw const FormatException('Повторный идентификатор сервера.');
+        }
+        id = '$id-legacy-${parsed.length}';
+        ids.add(id);
+      }
+      final name = row['name'];
+      if (name != null && name is! String) {
+        throw const FormatException('Некорректное имя сервера.');
+      }
+      final favorite = row['favorite'];
+      final latency = row['latencyMs'];
+      final checked = row['lastChecked'];
+      if ((favorite != null && favorite is! bool) ||
+          (latency != null && (latency is! int || latency < 0)) ||
+          (checked != null &&
+              (checked is! String || DateTime.tryParse(checked) == null)) ||
+          (row['customName'] != null && row['customName'] is! bool)) {
+        throw const FormatException('Некорректные свойства сервера.');
+      }
+      profile = profile.copyWith(
+        id: id,
+        name: name == null ? profile.name : _cleanTitle(name as String),
+        favorite: favorite as bool? ?? false,
+        latencyMs: latency as int?,
+        lastChecked: checked == null ? null : DateTime.parse(checked as String),
+        customName: row['customName'] as bool? ?? false,
+      );
+      parsed.add(profile);
+    }
+    var selectedIndex = raw['selected'] ?? 0;
+    if (version != 2 &&
+        selectedIndex is int &&
+        (selectedIndex < 0 || selectedIndex >= max(1, parsed.length))) {
+      selectedIndex = 0;
+    }
+    final exclusionsValue = raw['exclusions'] ?? '';
+    if (selectedIndex is! int ||
+        selectedIndex < 0 ||
+        selectedIndex >= max(1, parsed.length) ||
+        exclusionsValue is! String ||
+        exclusionsValue.length > 16384) {
+      throw const FormatException('Некорректный выбор сервера или исключения.');
+    }
+    final config = raw['settings'] ?? <String, dynamic>{};
+    if (config is! Map<String, dynamic>) {
+      throw const FormatException('Некорректные настройки.');
+    }
+    return {
+      'profiles': parsed,
+      'subscriptions': subs,
+      'selected': selectedIndex,
+      'exclusions': exclusionsValue,
+      'settings': _validateSettings({...defaultSettings, ...config}),
+      'migrated': version != 2,
+    };
+  }
+
+  void _applyDocument(Map<String, dynamic> document) {
+    profiles
+      ..clear()
+      ..addAll(document['profiles'] as List<Profile>);
+    subscriptions
+      ..clear()
+      ..addAll(document['subscriptions'] as List<Subscription>);
+    selected = document['selected'] as int;
+    exclusions = document['exclusions'] as String;
+    settings = document['settings'] as Map<String, dynamic>;
+  }
+
+  Map<String, dynamic> _validateSettings(Map<String, dynamic> value) {
+    if (value.keys.any((k) => !defaultSettings.containsKey(k))) {
+      throw const FormatException('Неизвестный параметр настроек.');
+    }
+    for (final key in [
+      'ipv6',
+      'fragment',
+      'reconnect',
+      'autoConnect',
+      'autostart',
+      'minimizeToTray',
+      'systemProxy',
+    ]) {
+      if (value[key] is! bool) {
+        throw const FormatException('Некорректный переключатель настройки.');
+      }
+    }
+    if (!['system', 'light', 'dark'].contains(value['theme']) ||
+        !['proxy', 'tun'].contains(value['mode']) ||
+        !['global', 'rules'].contains(value['routeMode'])) {
+      throw const FormatException('Некорректный режим настроек.');
+    }
+    final mtu = value['mtu'];
+    final port = value['proxyPort'];
+    if (mtu is! int ||
+        mtu < 1280 ||
+        mtu > 9000 ||
+        port is! int ||
+        port < 1024 ||
+        port > 65535) {
+      throw const FormatException('MTU: 1280–9000; порт: 1024–65535.');
+    }
+    for (final key in ['dns', 'directDns', 'interface']) {
+      if (value[key] is! String ||
+          (value[key] as String).length > 2048 ||
+          (value[key] as String).contains(RegExp(r'[\r\n\x00]'))) {
+        throw const FormatException('Некорректные сетевые настройки.');
+      }
+    }
+    final rules = value['rules'];
+    if (rules is! List || rules.length > 100) {
+      throw const FormatException('Допустимо не более 100 правил.');
+    }
+    for (final rule in rules) {
+      if (rule is! Map ||
+          !['direct', 'proxy', 'block'].contains(rule['action']) ||
+          !['domain', 'cidr', 'process'].contains(rule['type']) ||
+          rule['value'] is! String ||
+          (rule['value'] as String).trim().isEmpty ||
+          (rule['value'] as String).length > 1024 ||
+          rule.keys.any((key) => !['action', 'type', 'value'].contains(key))) {
+        throw const FormatException('Некорректное правило маршрутизации.');
+      }
+    }
+    return jsonDecode(jsonEncode(value)) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> _request(
+    String path, [
+    Map<String, dynamic>? body,
+  ]) async {
+    if (_token.isEmpty) {
+      _token = (await File('${directory.path}/token').readAsString()).trim();
+    }
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final request = await client
+          .openUrl(body == null ? 'GET' : 'POST', apiBase.resolve(path))
+          .timeout(const Duration(seconds: 3));
+      request.headers.set('Authorization', 'Bearer $_token');
+      if (body != null) {
+        request.headers.contentType = ContentType.json;
+        request.write(jsonEncode(body));
+      }
+      final response = await request.close().timeout(
+        const Duration(seconds: 25),
+      );
+      if (response.statusCode == 401) {
+        throw const FormatException('Токен службы не совпадает.');
+      }
+      final bytes = <int>[];
+      await for (final chunk in response.timeout(const Duration(seconds: 4))) {
+        bytes.addAll(chunk);
+        if (bytes.length > maxImportBytes) {
+          throw const FormatException('Ответ службы слишком большой.');
+        }
+      }
+      final data = jsonDecode(utf8.decode(bytes));
+      if (data is! Map<String, dynamic>) {
+        throw const FormatException('Некорректный ответ службы.');
+      }
+      if (response.statusCode >= 400) {
+        if (data['state'] is String) {
+          _apply(data);
+        }
+        throw FormatException(
+          data['error'] is String
+              ? data['error'] as String
+              : 'Ошибка службы ${response.statusCode}.',
+        );
+      }
+      return data;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> refresh() async {
+    if (_disposed || busy || _polling) {
+      return;
+    }
+    _polling = true;
+    try {
+      _apply(await _request('status'));
+    } catch (_) {
+      state = 'offline';
+    } finally {
+      _polling = false;
+      notifyListeners();
+    }
+  }
+
+  void _apply(Map<String, dynamic> data) {
+    status = data;
+    state = data['state'] as String? ?? 'offline';
+    mode = data['mode'] as String? ?? '';
+    message = _storageError.isEmpty
+        ? data['error'] as String? ?? ''
+        : _storageError;
+  }
+
+  Future<void> refreshLogs() async {
+    final result = await _request('logs');
+    final entries = result['entries'];
+    if (entries is List) {
+      logs
+        ..clear()
+        ..addAll(entries.whereType<Map<String, dynamic>>().take(500));
+      notifyListeners();
+    }
+  }
+
+  void clearLocalLogs() {
+    logs.clear();
+    notifyListeners();
+  }
+
+  Future<void> checkConnection() async => _runCommand(() async {
+    _apply(await _request('check', {}));
+  });
+  Future<void> reconnect() async {
+    if (profiles.isEmpty) {
+      return;
+    }
+    await _runCommand(() async {
+      _apply(await _request('connect', _connectBody()));
+    });
+  }
+
+  Map<String, dynamic> _connectBody() => {
+    'uri': profiles[selected].uri,
+    'exclusions': exclusions
+        .split(RegExp(r'[,\n]'))
+        .map((v) => v.trim())
+        .where((v) => v.isNotEmpty)
+        .toList(),
+    'settings': {for (final key in _networkKeys) key: settings[key]},
+  };
+  Future<void> toggle() async {
+    if (state == 'running') {
+      await _runCommand(() async {
+        _apply(await _request('disconnect', {}));
+      });
+    } else {
+      await reconnect();
+    }
+  }
+
+  Future<void> _runCommand(Future<void> Function() action) async {
+    if (busy) {
+      return;
+    }
+    busy = true;
+    message = '';
+    notifyListeners();
+    try {
+      await action();
+    } on FormatException catch (error) {
+      message = error.message;
+    } catch (_) {
+      state = 'offline';
+      message = 'Служба недоступна. Проверьте её запуск и токен.';
+    } finally {
+      busy = false;
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _timer?.cancel();
+    _subscriptionTimer?.cancel();
+    super.dispose();
+  }
+}
