@@ -19,40 +19,40 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
+static void window_method_call(FlMethodChannel* channel, FlMethodCall* call, gpointer user_data) {
+  GtkWindow* window = GTK_WINDOW(user_data);
+  const gchar* method = fl_method_call_get_name(call);
+  if (g_strcmp0(method, "minimize") == 0) gtk_window_iconify(window);
+  else if (g_strcmp0(method, "maximize") == 0) {
+    if (gtk_window_is_maximized(window)) gtk_window_unmaximize(window);
+    else gtk_window_maximize(window);
+  } else if (g_strcmp0(method, "close") == 0) gtk_window_close(window);
+  else if (g_strcmp0(method, "drag") == 0) {
+    GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+    GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
+    gint x = 0, y = 0;
+    gdk_device_get_position(pointer, nullptr, &x, &y);
+    gtk_window_begin_move_drag(window, 1, x, y, GDK_CURRENT_TIME);
+  } else {
+    fl_method_call_respond_not_implemented(call, nullptr);
+    return;
+  }
+  fl_method_call_respond_success(call, nullptr, nullptr);
+}
+
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
-  // Use a header bar when running in GNOME as this is the common style used
-  // by applications and is the setup most users will be using (e.g. Ubuntu
-  // desktop).
-  // If running on X and not using GNOME then just use a traditional title bar
-  // in case the window manager does more exotic layout, e.g. tiling.
-  // If running on Wayland assume the header bar will work (may need changing
-  // if future cases occur).
-  gboolean use_header_bar = TRUE;
-#ifdef GDK_WINDOWING_X11
-  GdkScreen* screen = gtk_window_get_screen(window);
-  if (GDK_IS_X11_SCREEN(screen)) {
-    const gchar* wm_name = gdk_x11_screen_get_window_manager_name(screen);
-    if (g_strcmp0(wm_name, "GNOME Shell") != 0) {
-      use_header_bar = FALSE;
-    }
-  }
-#endif
-  if (use_header_bar) {
-    GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
-    gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "Velum");
-    gtk_header_bar_set_show_close_button(header_bar, TRUE);
-    gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
-  } else {
-    gtk_window_set_title(window, "Velum");
-  }
-
-  gtk_window_set_default_size(window, 1280, 720);
+  gtk_window_set_title(window, "Velum");
+  gtk_window_set_decorated(window, FALSE);
+  gtk_window_set_default_size(window, 980, 760);
+  GdkGeometry minimum = {};
+  minimum.min_width = 440;
+  minimum.min_height = 640;
+  gtk_window_set_geometry_hints(window, nullptr, &minimum, GDK_HINT_MIN_SIZE);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
@@ -72,6 +72,13 @@ static void my_application_activate(GApplication* application) {
   g_signal_connect_swapped(view, "first-frame", G_CALLBACK(first_frame_cb),
                            self);
   gtk_widget_realize(GTK_WIDGET(view));
+
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  g_autoptr(FlMethodChannel) window_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "velum/window", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(window_channel, window_method_call,
+      g_object_ref(window), g_object_unref);
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 
