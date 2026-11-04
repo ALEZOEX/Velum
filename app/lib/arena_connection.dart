@@ -129,7 +129,7 @@ class _ArenaConnectionState extends State<ArenaConnection> {
       return Align(
         alignment: Alignment.topCenter,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 540),
+          constraints: const BoxConstraints(maxWidth: 760),
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
             children: [

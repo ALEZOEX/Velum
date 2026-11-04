@@ -55,6 +55,7 @@ class _VelumAppState extends State<VelumApp> {
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Velum',
+    scrollBehavior: const MaterialScrollBehavior().copyWith(scrollbars: false),
     debugShowCheckedModeBanner: false,
     theme: theme(Brightness.light),
     darkTheme: theme(Brightness.dark),
@@ -263,7 +264,7 @@ class _HomeState extends State<Home> {
       ),
       _ => Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560),
+          constraints: const BoxConstraints(maxWidth: 760),
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
             children: [

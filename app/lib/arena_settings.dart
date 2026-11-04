@@ -97,7 +97,7 @@ class _ArenaSettingsState extends State<ArenaSettings> {
   Widget build(BuildContext context) => Align(
     alignment: Alignment.topCenter,
     child: ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 560),
+      constraints: const BoxConstraints(maxWidth: 760),
       child: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
         child: screen == 'main' ? mainScreen() : subScreen(),

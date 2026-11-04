@@ -700,7 +700,7 @@ class _ArenaRoutingState extends State<ArenaRouting> {
   Widget build(BuildContext context) => Align(
     alignment: Alignment.topCenter,
     child: ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 560),
+      constraints: const BoxConstraints(maxWidth: 760),
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
         children: [
