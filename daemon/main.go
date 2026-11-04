@@ -116,7 +116,17 @@ func (s *service) connectRequest(req ConnectRequest) error {
 			iface = req.Settings.Interface
 		}
 		if tun && iface == "" {
-			return errors.New("Для XHTTP в TUN задайте исходящий физический интерфейс, чтобы исключить петлю маршрутизации")
+			u, _ := url.Parse(req.URI)
+			targetHost := ""
+			if u != nil {
+				targetHost = u.Hostname()
+			}
+			detected, detErr := detectOutboundInterface(targetHost)
+			if detErr == nil && detected != "" {
+				iface = detected
+			} else {
+				return errors.New("Для XHTTP в TUN не удалось автоматически определить физический интерфейс; укажите его в настройках")
+			}
 		}
 		bridgeAddress, err = freeAddress()
 		if err != nil {

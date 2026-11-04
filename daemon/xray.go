@@ -16,6 +16,52 @@ import (
 	"time"
 )
 
+func detectOutboundInterface(targetHost string) (string, error) {
+	if targetHost == "" {
+		targetHost = "1.1.1.1"
+	}
+	if h, _, err := net.SplitHostPort(targetHost); err == nil {
+		targetHost = h
+	}
+	ips, err := net.LookupIP(targetHost)
+	if err != nil || len(ips) == 0 {
+		return "", errors.New("не удалось разрешить адрес для выбора интерфейса")
+	}
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ips[0], Port: 53})
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	localIP := conn.LocalAddr().(*net.UDPAddr).IP
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 || iface.Name == "velum0" {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.Equal(localIP) {
+				return iface.Name, nil
+			}
+		}
+	}
+	return "", errors.New("не удалось сопоставить локальный адрес с физическим интерфейсом")
+}
+
 func isXHTTP(raw string) bool {
 	u, e := url.Parse(raw)
 	if e != nil {

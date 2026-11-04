@@ -112,11 +112,10 @@ def peer(folder):
         dns.socket = context.wrap_socket(dns.socket, server_side=True)
         servers.append(dns)
         threading.Thread(target=dns.serve_forever, daemon=True).start()
-        decoy = http.server.ThreadingHTTPServer(('127.0.0.1', 9443), Origin)
-        decoy.socket = context.wrap_socket(decoy.socket, server_side=True)
-        servers.append(decoy)
-        threading.Thread(target=decoy.serve_forever, daemon=True).start()
-        cfg = {'log': {'level': 'info'}, 'inbounds': [{'type': 'hysteria2', 'listen': '198.18.0.2', 'listen_port': 8443, 'users': [{'password': 'velum-local-test'}], 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}}], 'outbounds': [{'type': 'direct'}]}
+        cfg = {'log': {'level': 'info'}, 'inbounds': [
+            {'type': 'hysteria2', 'listen': '198.18.0.2', 'listen_port': 8443, 'users': [{'password': 'velum-local-test'}], 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}},
+            {'type': 'http', 'listen': '127.0.0.1', 'listen_port': 9443, 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}}
+        ], 'outbounds': [{'type': 'direct'}]}
         cfg['inbounds'].append({'type': 'vless', 'listen': '198.18.0.2', 'listen_port': 8444, 'users': [{'uuid': '00000000-0000-4000-8000-000000000001', 'flow': 'xtls-rprx-vision'}], 'tls': {'enabled': True, 'server_name': 'localhost', 'reality': {'enabled': True, 'private_key': (folder / 'reality-private').read_text(), 'short_id': ['abcd'], 'handshake': {'server': '127.0.0.1', 'server_port': 9443}}}})
         path = folder / 'server.json'
         path.write_text(json.dumps(cfg))
@@ -131,7 +130,7 @@ def peer(folder):
                 'inbounds': [{'listen': '198.18.0.2', 'port': 8445, 'protocol': 'vless',
                     'settings': {'clients': [{'id': '00000000-0000-4000-8000-000000000001'}], 'decryption': 'none'},
                     'streamSettings': {'network': 'xhttp', 'security': 'reality',
-                        'realitySettings': {'dest': '127.0.0.1:9443', 'serverNames': ['localhost'],
+                        'realitySettings': {'show': True, 'dest': '127.0.0.1:9443', 'serverNames': ['localhost'],
                             'privateKey': (folder / 'reality-private').read_text(), 'shortIds': ['abcd']},
                         'xhttpSettings': {'path': '/xhttp-test', 'mode': 'auto'}}}],
                 'outbounds': [{'protocol': 'freedom', 'tag': 'direct', 'settings': {'finalRules': [{'action': 'allow', 'ip': ['198.19.0.0/24', 'fd00:19::/64', '1.1.1.1/32']}]}}],
