@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -177,7 +178,25 @@ func buildConfigWithOutbound(out map[string]any, tun bool, interfaceName string,
 		if s.IPv6 == nil || *s.IPv6 {
 			addresses = append(addresses, "fdfe:7665:6c75::1/126")
 		}
-		inbounds = append(inbounds, map[string]any{"type": "tun", "tag": "tun", "interface_name": "velum0", "address": addresses, "mtu": s.MTU, "auto_route": true, "strict_route": true})
+		tunName := "velum0"
+		strictRoute := true
+		mtu := s.MTU
+		if runtime.GOOS == "windows" {
+			tunName = "Velum"
+			strictRoute = false
+			if s.MTU == 0 || s.MTU == 1400 {
+				mtu = 1500
+			}
+		}
+		inbounds = append(inbounds, map[string]any{
+			"type":           "tun",
+			"tag":            "tun",
+			"interface_name": tunName,
+			"address":        addresses,
+			"mtu":            mtu,
+			"auto_route":     true,
+			"strict_route":   strictRoute,
+		})
 	}
 	rules := []any{map[string]any{"action": "sniff"}, map[string]any{"protocol": "dns", "action": "hijack-dns"}}
 	dnsRules := []any{}

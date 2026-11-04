@@ -114,3 +114,23 @@ func TestHealthAndTrafficViaAuthenticatedCoreAPI(t *testing.T) {
 		t.Fatal("counters not sampled")
 	}
 }
+
+func TestTunInboundConfigValidation(t *testing.T) {
+	uri := "vless://00000000-0000-4000-8000-000000000001@192.0.2.1:443?security=reality&sni=example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd"
+	cfg, err := buildConfig(uri, true, "", ConnectionSettings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbounds, ok := cfg["inbounds"].([]any)
+	if !ok || len(inbounds) < 2 {
+		t.Fatal("expected mixed and tun inbounds")
+	}
+	tunInbound, ok := inbounds[1].(map[string]any)
+	if !ok || tunInbound["type"] != "tun" || tunInbound["auto_route"] != true {
+		t.Fatal("invalid tun inbound config")
+	}
+	if tunInbound["interface_name"] == "" {
+		t.Fatal("empty interface name")
+	}
+}
+

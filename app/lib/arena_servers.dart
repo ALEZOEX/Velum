@@ -608,7 +608,9 @@ class _ArenaServersState extends State<ArenaServers> {
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
-                      color: colors.primary,
+                      color: client.state == 'running' && chosen
+                          ? colors.primary
+                          : colors.onSurfaceVariant.withValues(alpha: .75),
                     ),
                   ),
                 SizedBox(

@@ -39,7 +39,8 @@ func detectOutboundInterface(targetHost string) (string, error) {
 		return "", err
 	}
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 || iface.Name == "velum0" {
+		nameLower := strings.ToLower(iface.Name)
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 || strings.HasPrefix(nameLower, "velum") {
 			continue
 		}
 		addrs, err := iface.Addrs()
