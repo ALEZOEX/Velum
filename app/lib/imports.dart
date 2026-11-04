@@ -114,7 +114,16 @@ Profile parseProfile(String input, {String? subscriptionId}) {
       uri.userInfo.isEmpty) {
     throw const FormatException('В ссылке отсутствуют учётные данные.');
   }
-  final name = uri.fragment.isEmpty ? uri.host : uri.fragment;
+  String name;
+  if (uri.fragment.isEmpty) {
+    name = uri.host;
+  } else {
+    try {
+      name = Uri.decodeComponent(uri.fragment);
+    } catch (_) {
+      name = uri.fragment;
+    }
+  }
   return Profile(
     raw,
     name,

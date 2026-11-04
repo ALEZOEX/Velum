@@ -249,6 +249,8 @@ func applyTransport(out map[string]any, q url.Values) error {
 		if host := q.Get("host"); host != "" {
 			t["host"] = strings.Split(host, ",")
 		}
+	case "xhttp", "splithttp":
+		return errors.New("Транспорт xhttp/SplitHTTP поддерживается только в Xray-core. В sing-box используйте профиль с TCP (порт 8544)")
 	default:
 		return errors.New("Транспорт не поддерживается ядром: доступны TCP, WebSocket, gRPC, HTTPUpgrade и HTTP/2")
 	}
