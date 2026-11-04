@@ -172,7 +172,7 @@ class _ArenaPattern extends CustomPainter {
       final paint = Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.15
-        ..color = colors.secondary.withValues(alpha: intensity / 100 * .16);
+        ..color = colors.secondary.withValues(alpha: intensity / 100 * .35);
       for (
         var y = 0.0;
         y < size.height;
@@ -210,7 +210,7 @@ class _ArenaPattern extends CustomPainter {
               2.2,
               Paint()
                 ..color = colors.primary.withValues(
-                  alpha: intensity / 100 * .16,
+                  alpha: intensity / 100 * .35,
                 ),
             );
           } else if (pattern == 'dot-constellation') {
@@ -235,6 +235,53 @@ class _ArenaPattern extends CustomPainter {
                 ..close(),
               paint,
             );
+          } else if (pattern == 'rings') {
+            for (final radius in [12.0, 24.0, 36.0]) {
+              canvas.drawCircle(const Offset(48, 48), radius, paint);
+            }
+          } else if (pattern == 'diamonds') {
+            canvas.drawPath(
+              Path()
+                ..moveTo(48, 8)
+                ..lineTo(88, 48)
+                ..lineTo(48, 88)
+                ..lineTo(8, 48)
+                ..close(),
+              paint,
+            );
+            canvas.drawPath(
+              Path()
+                ..moveTo(48, 24)
+                ..lineTo(72, 48)
+                ..lineTo(48, 72)
+                ..lineTo(24, 48)
+                ..close(),
+              paint,
+            );
+          } else if (pattern == 'triangles') {
+            canvas.drawPath(
+              Path()
+                ..moveTo(48, 10)
+                ..lineTo(88, 82)
+                ..lineTo(8, 82)
+                ..close(),
+              paint,
+            );
+            canvas.drawPath(
+              Path()
+                ..moveTo(48, 70)
+                ..lineTo(25, 30)
+                ..lineTo(71, 30)
+                ..close(),
+              paint,
+            );
+          } else if (pattern == 'crosses') {
+            for (var dy = 16.0; dy < 96; dy += 32) {
+              for (var dx = 16.0; dx < 96; dx += 32) {
+                canvas.drawLine(Offset(dx - 6, dy), Offset(dx + 6, dy), paint);
+                canvas.drawLine(Offset(dx, dy - 6), Offset(dx, dy + 6), paint);
+              }
+            }
           } else {
             canvas.drawPath(
               Path()

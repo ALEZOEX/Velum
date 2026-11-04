@@ -68,6 +68,10 @@ class _ArenaSettingsState extends State<ArenaSettings> {
     ('cyber-circuit', 'Диагональный контур'),
     ('dot-constellation', 'Матрица точек'),
     ('aurora-clean', 'Чистая Аврора'),
+    ('rings', 'Кольца'),
+    ('diamonds', 'Ромбы'),
+    ('triangles', 'Треугольники'),
+    ('crosses', 'Крестики'),
   ];
 
   Future<void> save(Map<String, dynamic> patch) async {
@@ -734,13 +738,24 @@ class _ArenaSettingsState extends State<ArenaSettings> {
                   ),
               ],
             ),
+            const SizedBox(height: 12),
+            Text(
+              (appearance['patternId'] ?? 'topography') == 'aurora-clean'
+                  ? 'В «Чистой Авроре» узора нет, поэтому яркость не меняется.'
+                  : 'Яркость узора: слева он незаметен, справа — заметнее. Градиент не меняется.',
+              style: TextStyle(fontSize: 12, color: secondary),
+            ),
             Slider(
+              semanticFormatterCallback: (value) =>
+                  'Яркость узора: ${value.round()}%',
               value: ((appearance['patternIntensity'] as num?) ?? 60)
                   .toDouble()
                   .clamp(0, 100),
               min: 0,
               max: 100,
-              onChanged: widget.onAppearanceChanged == null
+              onChanged:
+                  widget.onAppearanceChanged == null ||
+                      appearance['patternId'] == 'aurora-clean'
                   ? null
                   : (v) => appearanceChange({'patternIntensity': v.round()}),
             ),

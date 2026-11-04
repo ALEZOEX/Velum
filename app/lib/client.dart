@@ -972,6 +972,10 @@ class VelumClient extends ChangeNotifier {
           'cyber-circuit',
           'dot-constellation',
           'aurora-clean',
+          'rings',
+          'diamonds',
+          'triangles',
+          'crosses',
         ].contains(value['patternId']) ||
         value['patternIntensity'] is! int ||
         (value['patternIntensity'] as int) < 0 ||
