@@ -7,6 +7,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'client.dart';
+import 'arena_style.dart';
+import 'arena_connection.dart';
+import 'arena_settings.dart';
+import 'arena_routing.dart';
+import 'arena_servers.dart';
+import 'arena_import.dart';
+import 'arena_logs.dart';
+import 'arena_inspector.dart';
+import 'arena_icons.dart';
 
 void main() => runApp(const VelumApp());
 
@@ -38,65 +47,10 @@ class _VelumAppState extends State<VelumApp> {
     super.dispose();
   }
 
-  ThemeData theme(Brightness brightness) {
-    final dark = brightness == Brightness.dark;
-    final scheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xff29684f),
-      brightness: brightness,
-    );
-    return ThemeData(
-      useMaterial3: true,
-      colorScheme: scheme,
-      scaffoldBackgroundColor: dark
-          ? const Color(0xff111613)
-          : const Color(0xfff8f9f5),
-      visualDensity: VisualDensity.standard,
-      appBarTheme: const AppBarTheme(
-        centerTitle: false,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-      ),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: scheme.surfaceContainerLowest,
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: BorderSide(color: scheme.outlineVariant),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: BorderSide(color: scheme.outlineVariant),
-        ),
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 14,
-          vertical: 14,
-        ),
-      ),
-      dividerTheme: DividerThemeData(
-        color: scheme.outlineVariant.withValues(alpha: .65),
-        space: 1,
-      ),
-      filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 18),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-        ),
-      ),
-      outlinedButtonTheme: OutlinedButtonThemeData(
-        style: OutlinedButton.styleFrom(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-        ),
-      ),
-      snackBarTheme: const SnackBarThemeData(
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
+  ThemeData theme(Brightness brightness) => arenaTheme(
+    brightness,
+    themeId: client.settings['themeId'] as String? ?? 'velum-acid-violet',
+  );
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -104,11 +58,7 @@ class _VelumAppState extends State<VelumApp> {
     debugShowCheckedModeBanner: false,
     theme: theme(Brightness.light),
     darkTheme: theme(Brightness.dark),
-    themeMode: switch (client.settings['theme']) {
-      'light' => ThemeMode.light,
-      'dark' => ThemeMode.dark,
-      _ => ThemeMode.system,
-    },
+    themeMode: ThemeMode.dark,
     home: Home(client: client),
   );
 }
@@ -222,6 +172,11 @@ class _HomeState extends State<Home> {
   }
 
   void navigate(int index) {
+    if (index == 4) {
+      unawaited(action(client.refreshLogs));
+      unawaited(showArenaLogs(context, client));
+      return;
+    }
     setState(() {
       page = index;
       notice = null;
@@ -230,11 +185,43 @@ class _HomeState extends State<Home> {
     if (index == 4) unawaited(action(client.refreshLogs));
   }
 
-  void openImport() {
-    setState(() {
-      page = 1;
-      importVisible = true;
-    });
+  void openImport() => unawaited(showArenaImport(context, client));
+
+  Future<void> openUrl(String value) async {
+    final uri = Uri.tryParse(value);
+    if (uri == null ||
+        !['https', 'http', 'mailto', 'tg'].contains(uri.scheme)) {
+      return;
+    }
+    try {
+      if (Platform.isLinux) await Process.start('xdg-open', [value]);
+    } catch (_) {
+      if (mounted) setState(() => noticeError = 'Не удалось открыть ссылку.');
+    }
+  }
+
+  Future<void> windowAction(String action) async {
+    try {
+      await const MethodChannel('velum/window').invokeMethod<void>(action);
+    } on MissingPluginException {
+      if (action == 'close') await SystemNavigator.pop();
+    }
+  }
+
+  void inspectServer(int index) {
+    final identity = client.profiles[index].id;
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: .75),
+      builder: (_) => ArenaInspector(
+        client: client,
+        index: index,
+        onAction: (value) {
+          final current = client.profiles.indexWhere((p) => p.id == identity);
+          if (current >= 0) unawaited(profileAction(value, current));
+        },
+      ),
+    );
   }
 
   @override
@@ -242,263 +229,343 @@ class _HomeState extends State<Home> {
     if (!exclusionsDirty && exclusions.text != client.exclusions) {
       exclusions.text = client.exclusions;
     }
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final drawer = constraints.maxWidth < 660;
-        final expanded = constraints.maxWidth >= 1100;
-        return Scaffold(
-          appBar: drawer
-              ? AppBar(
-                  title: const Text('Velum'),
-                  actions: [
-                    IconButton(
-                      tooltip: 'Добавить подключение',
-                      onPressed: importing ? null : openImport,
-                      icon: const Icon(Icons.add),
-                    ),
-                  ],
-                )
-              : null,
-          drawer: drawer
-              ? Drawer(child: SafeArea(child: navigation(true, drawer: true)))
-              : null,
-          body: SafeArea(
-            child: Row(
-              children: [
-                if (!drawer)
-                  SizedBox(
-                    width: expanded ? 206 : 76,
-                    child: navigation(expanded),
+    final scheme = Theme.of(context).colorScheme;
+    final body = switch (page) {
+      0 => ArenaConnection(
+        client: client,
+        onImport: openImport,
+        onSubscriptions: () => navigate(2),
+        onInspect: inspectServer,
+        onQr: () => unawaited(showArenaImport(context, client, scan: true)),
+        onOpenUrl: (url) => unawaited(openUrl(url)),
+      ),
+      1 => ArenaServers(
+        client: client,
+        onImport: openImport,
+        onInspect: inspectServer,
+        onQr: () => unawaited(showArenaImport(context, client, scan: true)),
+        onSubscriptions: () => navigate(2),
+      ),
+      3 => ArenaRouting(
+        client: client,
+        onBack: () => navigate(0),
+        advancedRules: Column(children: routingPage()),
+      ),
+      5 => ArenaSettings(
+        client: client,
+        onRouting: () => navigate(3),
+        onLogs: () => navigate(4),
+        onSubscriptions: () => navigate(2),
+        advancedSettings: Column(children: settingsPage()),
+        appearance: client.settings,
+        onAppearanceChanged: (patch) =>
+            unawaited(action(() => client.saveSettings(patch))),
+      ),
+      _ => Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
+            children: [
+              Row(
+                children: [
+                  IconButton(
+                    onPressed: () => navigate(0),
+                    icon: const ArenaGlyph('ArrowLeft'),
                   ),
-                if (!drawer) const VerticalDivider(width: 1),
-                Expanded(
-                  child: Column(
-                    children: [
-                      Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          drawer ? 20 : 28,
-                          24,
-                          drawer ? 20 : 28,
-                          20,
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    pages[page].$1,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .headlineSmall
-                                        ?.copyWith(
-                                          fontWeight: FontWeight.w600,
-                                          letterSpacing: -.4,
-                                        ),
-                                  ),
-                                  const SizedBox(height: 5),
-                                  Text(
-                                    subtitle(),
+                  Text(
+                    pages[page].$1,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+              ...page == 2 ? subscriptionsPage() : logsPage(),
+            ],
+          ),
+        ),
+      ),
+    };
+    return Scaffold(
+      body: SafeArea(
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: ArenaBackdrop(
+                patternId:
+                    client.settings['patternId'] as String? ?? 'topography',
+                intensity: client.settings['patternIntensity'] as int? ?? 68,
+                connected: running,
+              ),
+            ),
+            Column(
+              children: [
+                SizedBox(
+                  height: 48,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: GestureDetector(
+                            onPanStart: (_) => unawaited(windowAction('drag')),
+                            onDoubleTap: () =>
+                                unawaited(windowAction('maximize')),
+                            child: Row(
+                              children: [
+                                ShaderMask(
+                                  shaderCallback: (rect) => LinearGradient(
+                                    colors: [
+                                      scheme.primary,
+                                      const Color(0xffc084fc),
+                                    ],
+                                  ).createShader(rect),
+                                  child: const Text(
+                                    'VELUM',
                                     style: TextStyle(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .onSurfaceVariant,
-                                      fontSize: 13,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 1.08,
+                                      color: Colors.white,
                                     ),
                                   ),
-                                ],
-                              ),
+                                ),
+                                const SizedBox(width: 10),
+                                const Text(
+                                  'v0.2.0',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Color(0x8ce9d5ff),
+                                  ),
+                                ),
+                              ],
                             ),
-                            if (!drawer && (page == 1 || page == 2))
-                              IconButton.filledTonal(
-                                tooltip: 'Добавить подключение',
-                                onPressed: importing ? null : openImport,
-                                icon: const Icon(Icons.add),
-                              ),
-                          ],
-                        ),
-                      ),
-                      const Divider(),
-                      Expanded(
-                        child: SelectionArea(
-                          child: ListView(
-                            padding: EdgeInsets.fromLTRB(
-                              drawer ? 20 : 28,
-                              24,
-                              drawer ? 20 : 28,
-                              32,
-                            ),
-                            children: [
-                              if (noticeError != null)
-                                message(noticeError!, error: true),
-                              if (notice != null) message(notice!),
-                              if (client.message.isNotEmpty && page != 4)
-                                message(client.message, error: true),
-                              ...switch (page) {
-                                0 => connectionPage(),
-                                1 => serversPage(),
-                                2 => subscriptionsPage(),
-                                3 => routingPage(),
-                                4 => logsPage(),
-                                _ => settingsPage(),
-                              },
-                            ],
                           ),
                         ),
-                      ),
-                    ],
+                        SizedBox(
+                          key: const ValueKey('nav-3'),
+                          child: arenaSmallButton(
+                            'Globe',
+                            'Профили маршрутизации',
+                            () => navigate(page == 3 ? 0 : 3),
+                            acid: client.settings['routeMode'] == 'rules',
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        SizedBox(
+                          key: const ValueKey('nav-4'),
+                          child: arenaSmallButton(
+                            'Terminal',
+                            'Журнал и конфигурация',
+                            () => navigate(4),
+                          ),
+                        ),
+                        Container(
+                          width: 1,
+                          height: 16,
+                          margin: const EdgeInsets.symmetric(horizontal: 8),
+                          color: Colors.white.withValues(alpha: .1),
+                        ),
+                        for (final entry in [
+                          ('Minus', 'minimize'),
+                          ('Square', 'maximize'),
+                          ('X', 'close'),
+                        ])
+                          SizedBox(
+                            width: 32,
+                            height: 32,
+                            child: IconButton(
+                              padding: EdgeInsets.zero,
+                              onPressed: () =>
+                                  unawaited(windowAction(entry.$2)),
+                              tooltip: entry.$2,
+                              icon: ArenaGlyph(
+                                entry.$1,
+                                size: 14,
+                                color: const Color(0xa6e9d5ff),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
+                Expanded(child: body),
               ],
             ),
-          ),
-        );
-      },
-    );
-  }
-
-  String subtitle() => switch (page) {
-    0 => 'Ваш сервер. Ваш маршрут.',
-    1 => '${client.profiles.length} серверов · выбор и проверка доступности',
-    2 => 'Источники серверов и обновления',
-    3 => 'Куда отправлять трафик',
-    4 => 'События соединения и диагностика',
-    _ => 'Сеть, внешний вид и данные',
-  };
-  Widget navigation(bool expanded, {bool drawer = false}) {
-    final scheme = Theme.of(context).colorScheme;
-    return ColoredBox(
-      color: scheme.surfaceContainerLow,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: EdgeInsets.fromLTRB(
-              expanded ? 20 : 0,
-              28,
-              expanded ? 20 : 0,
-              34,
-            ),
-            child: expanded
-                ? Row(
-                    children: [
-                      Icon(
-                        Icons.blur_on_rounded,
-                        color: scheme.primary,
-                        size: 27,
-                      ),
-                      const SizedBox(width: 10),
-                      Text(
-                        'Velum',
-                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: -.5,
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 16,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 440),
+                  child: Container(
+                    key: const ValueKey('arena-dock'),
+                    height: MediaQuery.sizeOf(context).width >= 640 ? 52 : 66,
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xe00e071b),
+                      borderRadius: BorderRadius.circular(40),
+                      border: Border.all(color: const Color(0x38a855f7)),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0xa6000000),
+                          offset: Offset(0, 14),
+                          blurRadius: 40,
                         ),
-                      ),
-                    ],
-                  )
-                : Icon(Icons.blur_on_rounded, color: scheme.primary, size: 28),
-          ),
-          for (final entry in pages.indexed)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-              child: Tooltip(
-                message: expanded ? '' : entry.$2.$1,
-                child: Material(
-                  color: page == entry.$1
-                      ? scheme.secondaryContainer
-                      : Colors.transparent,
-                  borderRadius: BorderRadius.circular(10),
-                  child: InkWell(
-                    key: ValueKey('nav-${entry.$1}'),
-                    borderRadius: BorderRadius.circular(10),
-                    onTap: () {
-                      navigate(entry.$1);
-                      if (drawer) Navigator.pop(context);
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 15,
-                      ),
-                      child: Row(
-                        mainAxisAlignment: expanded
-                            ? MainAxisAlignment.start
-                            : MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            entry.$2.$2,
-                            size: 21,
-                            color: page == entry.$1
-                                ? scheme.onSecondaryContainer
-                                : scheme.onSurfaceVariant,
-                          ),
-                          if (expanded) ...[
-                            const SizedBox(width: 12),
-                            Flexible(
-                              child: Text(
-                                entry.$2.$1,
-                                style: TextStyle(
-                                  fontWeight: page == entry.$1
-                                      ? FontWeight.w600
-                                      : FontWeight.w400,
-                                  fontSize: 13,
+                      ],
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (final entry in [
+                          (0, 'Share2', 'Подключение'),
+                          (1, 'Server', 'Серверы'),
+                          (5, 'Settings', 'Настройки'),
+                        ])
+                          Expanded(
+                            child: LayoutBuilder(
+                              builder: (context, c) => Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 2,
+                                ),
+                                child: TextButton(
+                                  key: ValueKey('nav-${entry.$1}'),
+                                  onPressed: () => navigate(entry.$1),
+                                  style: TextButton.styleFrom(
+                                    minimumSize: Size.zero,
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                    padding: EdgeInsets.symmetric(
+                                      vertical:
+                                          MediaQuery.sizeOf(context).width >=
+                                              640
+                                          ? 10
+                                          : 8,
+                                      horizontal: 4,
+                                    ),
+                                    shape: StadiumBorder(
+                                      side: BorderSide(
+                                        color: page == entry.$1
+                                            ? scheme.primary.withValues(
+                                                alpha: .45,
+                                              )
+                                            : Colors.transparent,
+                                      ),
+                                    ),
+                                    backgroundColor: page == entry.$1
+                                        ? scheme.secondary.withValues(alpha: .2)
+                                        : Colors.transparent,
+                                  ),
+                                  child: MediaQuery.sizeOf(context).width >= 640
+                                      ? Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            ArenaGlyph(
+                                              entry.$2,
+                                              size: 16,
+                                              color: page == entry.$1
+                                                  ? scheme.primary
+                                                  : const Color(0xa6d8ccf0),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Flexible(
+                                              child: Text(
+                                                entry.$3,
+                                                style: TextStyle(
+                                                  fontSize: 12,
+                                                  height: 1.2,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: page == entry.$1
+                                                      ? Colors.white
+                                                      : const Color(0xa6d8ccf0),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        )
+                                      : Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            ArenaGlyph(
+                                              entry.$2,
+                                              size: 16,
+                                              color: page == entry.$1
+                                                  ? scheme.primary
+                                                  : const Color(0xa6d8ccf0),
+                                            ),
+                                            const SizedBox(height: 4),
+                                            Text(
+                                              entry.$3,
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                height: 1.2,
+                                                fontWeight: FontWeight.bold,
+                                                color: page == entry.$1
+                                                    ? Colors.white
+                                                    : const Color(0xa6d8ccf0),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
                                 ),
                               ),
                             ),
-                          ],
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (noticeError != null || notice != null)
+              Positioned(
+                top: 54,
+                left: 24,
+                right: 24,
+                child: Center(
+                  child: Material(
+                    color: const Color(0xff120924),
+                    borderRadius: BorderRadius.circular(30),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              noticeError ?? notice!,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: noticeError != null
+                                    ? scheme.error
+                                    : scheme.primary,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            onPressed: () => setState(() {
+                              noticeError = null;
+                              notice = null;
+                            }),
+                            icon: const ArenaGlyph('X'),
+                            iconSize: 14,
+                          ),
                         ],
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
-          const Spacer(),
-          Padding(
-            padding: EdgeInsets.all(expanded ? 20 : 12),
-            child: expanded
-                ? Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          statusDot(),
-                          const SizedBox(width: 8),
-                          Flexible(
-                            child: Text(
-                              client.state == 'offline'
-                                  ? 'Нет связи со службой'
-                                  : running
-                                  ? 'Ядро работает'
-                                  : 'Не подключено',
-                              style: const TextStyle(fontSize: 12),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Velum · Linux',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  )
-                : Tooltip(
-                    message: client.state == 'offline'
-                        ? 'Служба недоступна'
-                        : running
-                        ? 'Ядро работает'
-                        : 'Не подключено',
-                    child: Center(child: statusDot()),
-                  ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -586,46 +653,38 @@ class _HomeState extends State<Home> {
         ? 'Соединение проверено'
         : 'Ядро запущено';
     return [
-      Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.secondaryContainer,
-              borderRadius: BorderRadius.circular(14),
+      Center(
+        child: Column(
+          children: [
+            const SizedBox(height: 8),
+            ArenaPowerButton(
+              running: running,
+              busy: locked,
+              onPressed: locked || (!running && selectedProfile == null)
+                  ? null
+                  : () => action(client.toggle),
             ),
-            child: Icon(
-              running ? Icons.link_rounded : Icons.link_off_rounded,
-              size: 28,
-              color: Theme.of(context).colorScheme.onSecondaryContainer,
+            const SizedBox(height: 18),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
             ),
-          ),
-          const SizedBox(width: 18),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: Theme.of(context).textTheme.headlineSmall
-                      ?.copyWith(fontWeight: FontWeight.w500),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  running
-                      ? client.mode == 'tun'
-                            ? 'Системный туннель активен'
-                            : 'Прокси для выбранных приложений'
-                      : 'Выберите сервер и включите соединение.',
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
+            const SizedBox(height: 6),
+            Text(
+              running
+                  ? client.mode == 'tun'
+                        ? 'Системный туннель активен'
+                        : 'Локальный прокси активен'
+                  : 'Выберите сервер и включите соединение.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
       const SizedBox(height: 28),
       surface(
