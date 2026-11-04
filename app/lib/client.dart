@@ -11,6 +11,11 @@ export 'models.dart';
 
 const defaultSettings = <String, dynamic>{
   'theme': 'system',
+  'themeId': 'velum-acid-violet',
+  'patternId': 'topography',
+  'patternIntensity': 68,
+  'desktopLayout': 'compact',
+  'language': 'ru',
   'mode': 'proxy',
   'mtu': 1400,
   'ipv6': true,
@@ -46,7 +51,8 @@ class VelumClient extends ChangeNotifier {
     : directory =
           directory ??
           Directory(
-            '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
+            Platform.environment['VELUM_CONFIG_DIR'] ??
+                '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
           ),
       apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
   final Directory directory;
@@ -309,6 +315,10 @@ class VelumClient extends ChangeNotifier {
           error: '',
           supportUrl: _safeWebUrl(header('support-url')),
           webpageUrl: _safeWebUrl(header('profile-web-page-url')),
+          announceText: (header('announce') ?? '').substring(
+            0,
+            (header('announce') ?? '').length.clamp(0, 4096),
+          ),
         ),
         profiles: parsed,
       );
@@ -726,7 +736,12 @@ class VelumClient extends ChangeNotifier {
   }
 
   String _cleanTitle(String value) {
-    final clean = value.trim();
+    var clean = value.trim();
+    if (clean.contains('%')) {
+      try {
+        clean = Uri.decodeComponent(clean).trim();
+      } catch (_) {}
+    }
     if (clean.isEmpty ||
         clean.length > 200 ||
         clean.contains(RegExp(r'[\r\n\x00]'))) {
@@ -813,6 +828,12 @@ class VelumClient extends ChangeNotifier {
           download: number('download'),
           total: number('total'),
           expires: date('expires'),
+          announceText: row['announceText'] is String
+              ? (row['announceText'] as String).substring(
+                  0,
+                  (row['announceText'] as String).length.clamp(0, 4096),
+                )
+              : null,
           error: row['error'] is String ? row['error'] as String : '',
           supportUrl: row['supportUrl'] is String
               ? _safeWebUrl(row['supportUrl'] as String)
@@ -937,6 +958,27 @@ class VelumClient extends ChangeNotifier {
         !['proxy', 'tun'].contains(value['mode']) ||
         !['global', 'rules'].contains(value['routeMode'])) {
       throw const FormatException('Некорректный режим настроек.');
+    }
+    if (![
+          'velum-acid-violet',
+          'hyper-amethyst',
+          'cyber-orchid',
+          'acid-matrix',
+          'incy-emerald',
+        ].contains(value['themeId']) ||
+        ![
+          'topography',
+          'hex-grid',
+          'cyber-circuit',
+          'dot-constellation',
+          'aurora-clean',
+        ].contains(value['patternId']) ||
+        value['patternIntensity'] is! int ||
+        (value['patternIntensity'] as int) < 0 ||
+        (value['patternIntensity'] as int) > 100 ||
+        !['compact', 'wide'].contains(value['desktopLayout']) ||
+        !['ru', 'en'].contains(value['language'])) {
+      throw const FormatException('Некорректные параметры оформления.');
     }
     final mtu = value['mtu'];
     final port = value['proxyPort'];

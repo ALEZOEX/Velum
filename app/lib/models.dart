@@ -119,6 +119,7 @@ class Subscription {
     this.error = '',
     this.supportUrl,
     this.webpageUrl,
+    this.announceText,
   });
   final String id;
   final String url;
@@ -134,6 +135,7 @@ class Subscription {
   final String error;
   final String? supportUrl;
   final String? webpageUrl;
+  final String? announceText;
   Subscription copyWith({
     String? title,
     String? userAgent,
@@ -147,6 +149,7 @@ class Subscription {
     String? error,
     String? supportUrl,
     String? webpageUrl,
+    String? announceText,
   }) => Subscription(
     id: id,
     url: url,
@@ -162,6 +165,7 @@ class Subscription {
     error: error ?? this.error,
     supportUrl: supportUrl ?? this.supportUrl,
     webpageUrl: webpageUrl ?? this.webpageUrl,
+    announceText: announceText ?? this.announceText,
   );
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -178,5 +182,6 @@ class Subscription {
     'error': error,
     'supportUrl': supportUrl,
     'webpageUrl': webpageUrl,
+    'announceText': announceText,
   };
 }

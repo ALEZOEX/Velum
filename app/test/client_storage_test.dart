@@ -110,4 +110,30 @@ void main() {
       expect(client.profiles.length, 1);
     },
   );
+  test('Appearance and provider announcement survive backup restore', () async {
+    await client.saveSettings({
+      'themeId': 'cyber-orchid',
+      'patternId': 'hex-grid',
+      'patternIntensity': 42,
+    });
+    client.subscriptions.add(
+      const Subscription(
+        id: 'sub',
+        url: 'https://example.invalid/sub',
+        title: 'Provider',
+        announceText: 'Provider message',
+      ),
+    );
+    final backup = client.exportBackup();
+    await client.restoreBackup(backup);
+    expect(client.settings['themeId'], 'cyber-orchid');
+    expect(client.settings['patternId'], 'hex-grid');
+    expect(client.settings['patternIntensity'], 42);
+    expect(client.subscriptions.single.announceText, 'Provider message');
+    await expectLater(
+      client.saveSettings({'patternIntensity': 101}),
+      throwsFormatException,
+    );
+    expect(client.settings['patternIntensity'], 42);
+  });
 }
