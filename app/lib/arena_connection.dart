@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 
 import 'client.dart';
 import 'arena_icons.dart';
+import 'rotating_refresh.dart';
+import 'network_mode_control.dart';
 
 /// Connection screen translated from Arena's ConnectionView and PowerOrb.
 class ArenaConnection extends StatefulWidget {
@@ -86,6 +88,7 @@ class _ArenaConnectionState extends State<ArenaConnection> {
     String tooltip,
     VoidCallback? callback, {
     bool highlighted = false,
+    bool rotating = false,
   }) => SizedBox(
     width: 32,
     height: 32,
@@ -97,10 +100,13 @@ class _ArenaConnectionState extends State<ArenaConnection> {
         backgroundColor: Colors.white.withValues(alpha: .05),
         side: BorderSide(color: Colors.white.withValues(alpha: .10)),
       ),
-      icon: ArenaGlyph(
-        _glyphName(icon),
-        size: 15,
-        color: highlighted ? acid : muted,
+      icon: RotatingRefresh(
+        active: rotating,
+        child: ArenaGlyph(
+          _glyphName(icon),
+          size: 15,
+          color: highlighted ? acid : muted,
+        ),
       ),
     ),
   );
@@ -134,6 +140,7 @@ class _ArenaConnectionState extends State<ArenaConnection> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 112),
             children: [
               _orb(),
+              NetworkModeControl(client: client),
               if (client.message.isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
@@ -270,6 +277,9 @@ class _ArenaConnectionState extends State<ArenaConnection> {
                                       () =>
                                           client.updateSubscription(current.id),
                                     ),
+                              rotating: client.updatingSubscriptions.contains(
+                                current.id,
+                              ),
                             ),
                           ] else
                             smallButton(
@@ -1006,7 +1016,9 @@ class _ArenaConnectionState extends State<ArenaConnection> {
                             ),
                           )
                         : ArenaGlyph(
-                            running ? 'Shield' : 'Power',
+                            running && client.mode == 'tun' && client.verified
+                                ? 'Shield'
+                                : 'Power',
                             size: running ? 64 : 60,
                             color: running ? acid : const Color(0xffcfc3ea),
                           ),

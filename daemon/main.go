@@ -35,6 +35,9 @@ type ConnectRequest struct {
 type service struct {
 	mu                                                   sync.Mutex
 	cmd                                                  *exec.Cmd
+	xrayCmd                                              *exec.Cmd
+	xrayDone                                             chan struct{}
+	xray                                                 string
 	done                                                 chan struct{}
 	state, lastError, core, interfaceName, dir, token    string
 	tun                                                  bool
@@ -66,6 +69,12 @@ func (s *service) stopCore() {
 			}
 		}
 	}
+	stopProcess(s.xrayCmd, s.xrayDone)
+	s.xrayCmd = nil
+	s.xrayDone = nil
+	if s.dir != "" {
+		_ = os.Remove(filepath.Join(s.dir, "xray.json"))
+	}
 	s.cmd = nil
 	s.state = "disconnected"
 	s.verified = false
@@ -92,7 +101,43 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	if req.Settings.Mode != "" {
 		tun = req.Settings.Mode == "tun"
 	}
-	cfg, err := buildConfig(req.URI, tun, s.interfaceName, req.Settings)
+	var cfg, companionConfig map[string]any
+	var err error
+	var bridgeAddress string
+	if isXHTTP(req.URI) {
+		if s.xray == "" {
+			return errors.New("Для XHTTP необходимо установить Xray и запустить службу с --xray /полный/путь/xray")
+		}
+		if req.Settings.Fragment {
+			return errors.New("Для XHTTP отключите TLS-фрагментацию: она пока доступна только в sing-box")
+		}
+		iface := s.interfaceName
+		if req.Settings.Interface != "" {
+			iface = req.Settings.Interface
+		}
+		if tun && iface == "" {
+			return errors.New("Для XHTTP в TUN задайте исходящий физический интерфейс, чтобы исключить петлю маршрутизации")
+		}
+		bridgeAddress, err = freeAddress()
+		if err != nil {
+			return errors.New("Не удалось выделить локальный порт Xray")
+		}
+		password, e := randomBridgePassword()
+		if e != nil {
+			return e
+		}
+		companionConfig, err = xrayConfig(req.URI, bridgeAddress, password, iface)
+		if err != nil {
+			return err
+		}
+		bridge, e := bridgeOutbound(bridgeAddress, password)
+		if e != nil {
+			return e
+		}
+		cfg, err = buildConfigWithOutbound(bridge, tun, s.interfaceName, req.Settings)
+	} else {
+		cfg, err = buildConfig(req.URI, tun, s.interfaceName, req.Settings)
+	}
 	if err != nil {
 		return err
 	}
@@ -125,12 +170,39 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	if err = exec.CommandContext(ctx, s.core, "check", "-c", candidate).Run(); err != nil {
 		return errors.New("sing-box отклонил конфигурацию; проверьте протокол, параметры и сборку ядра")
 	}
+	xrayCandidate := filepath.Join(s.dir, "candidate-xray.json")
+	if companionConfig != nil {
+		defer os.Remove(xrayCandidate)
+		if err = writeCheckedXray(s.xray, xrayCandidate, companionConfig); err != nil {
+			return err
+		}
+	}
 	s.stopCore()
 	if err = os.Rename(candidate, path); err != nil {
 		return err
 	}
 	cmd := exec.Command(s.core, "run", "-c", path)
-	s.logs.setSecrets(collectSecrets(cfg, req.URI, secret))
+	secrets := collectSecrets(cfg, req.URI, secret)
+	if companionConfig != nil {
+		secrets = append(secrets, collectSecrets(companionConfig, req.URI, secret)...)
+	}
+	s.logs.setSecrets(secrets)
+	success := false
+	defer func() {
+		if !success {
+			s.stopCore()
+		}
+	}()
+	if companionConfig != nil {
+		xrayPath := filepath.Join(s.dir, "xray.json")
+		if err = os.Rename(xrayCandidate, xrayPath); err != nil {
+			return err
+		}
+		s.xrayCmd, s.xrayDone, err = startCompanion(s.xray, xrayPath, bridgeAddress, &s.logs)
+		if err != nil {
+			return err
+		}
+	}
 	cmd.Stdout = &s.logs
 	cmd.Stderr = &s.logs
 	if err = cmd.Start(); err != nil {
@@ -146,6 +218,13 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		s.state = "error"
 		return errors.New("Ядро завершилось при запуске; проверьте журнал, права TUN и занятость портов")
 	case <-time.After(500 * time.Millisecond):
+		if s.xrayCmd != nil {
+			select {
+			case <-s.xrayDone:
+				return errors.New("Xray завершился при запуске")
+			default:
+			}
+		}
 		s.state = "running"
 		s.lastError = ""
 		s.connectedAt = time.Now().UTC()
@@ -164,6 +243,7 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		s.downloadTotal = nil
 		s.uploadRate = nil
 		s.downloadRate = nil
+		success = true
 		s.logs.add("info", "Сетевое ядро запущено")
 		return nil
 	}
@@ -261,17 +341,27 @@ func (s *service) check() error {
 	return nil
 }
 func (s *service) inspectProcess() {
+	message := ""
+	if s.xrayCmd != nil {
+		select {
+		case <-s.xrayDone:
+			message = "Ядро Xray неожиданно завершилось"
+		default:
+		}
+	}
 	if s.cmd != nil {
 		select {
 		case <-s.done:
-			s.cmd = nil
-			s.state = "error"
-			s.verified = false
-			s.lastError = "Сетевое ядро неожиданно завершилось"
-			s.logs.add("error", s.lastError)
-			s.reconnectAt = time.Now().Add(2 * time.Second)
+			message = "Сетевое ядро неожиданно завершилось"
 		default:
 		}
+	}
+	if message != "" {
+		s.stopCore()
+		s.state = "error"
+		s.lastError = message
+		s.logs.add("error", message)
+		s.reconnectAt = time.Now().Add(2 * time.Second)
 	}
 }
 func (s *service) monitor(ctx context.Context) {
@@ -316,10 +406,25 @@ func (s *service) status() map[string]any {
 	if port == 0 {
 		port = 2080
 	}
-	return map[string]any{"state": s.state, "error": s.lastError, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts}
+	engine := "sing-box"
+	if s.xrayCmd != nil {
+		engine = "sing-box+xray"
+	}
+	return map[string]any{"state": s.state, "error": s.lastError, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine}
 }
 func probe(uri string) map[string]any {
-	out, err := outbound(uri)
+	probeURI := uri
+	if isXHTTP(uri) {
+		if _, err := xrayConfig(uri, "127.0.0.1:12345", "validation-only", ""); err != nil {
+			return map[string]any{"ok": false, "error": err.Error(), "kind": "tcp", "latencyMs": nil}
+		}
+		u, _ := url.Parse(uri)
+		q := u.Query()
+		q.Set("type", "tcp")
+		u.RawQuery = q.Encode()
+		probeURI = u.String()
+	}
+	out, err := outbound(probeURI)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "kind": "tcp", "latencyMs": nil}
 	}
@@ -402,7 +507,11 @@ func main() {
 	tokenFile := flag.String("token-file", "", "Existing private token file")
 	tun := flag.Bool("tun", false, "Allow TUN (requires network privileges)")
 	interfaceName := flag.String("interface", "", "Bind outbound sockets to this existing interface")
+	xray := flag.String("xray", "", "Absolute path to trusted optional Xray executable for XHTTP")
 	flag.Parse()
+	if err := validateXrayExecutable(*xray); err != nil {
+		log.Fatal(err)
+	}
 	if err := (ConnectionSettings{Interface: *interfaceName}).validate(*tun); err != nil {
 		log.Fatal(err)
 	}
@@ -436,7 +545,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	s := &service{core: *core, interfaceName: *interfaceName, tun: *tun, dir: dir, token: token, state: "disconnected"}
+	s := &service{xray: *xray, core: *core, interfaceName: *interfaceName, tun: *tun, dir: dir, token: token, state: "disconnected"}
 	listener, err := net.Listen("tcp4", "127.0.0.1:27841")
 	if err != nil {
 		log.Fatal(err)

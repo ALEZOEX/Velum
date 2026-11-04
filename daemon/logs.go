@@ -35,7 +35,7 @@ func collectSecrets(cfg map[string]any, uri, apiSecret string) []string {
 		switch value := v.(type) {
 		case map[string]any:
 			for k, v := range value {
-				if k == "password" || k == "uuid" || k == "public_key" || k == "private_key" || k == "username" {
+				if k == "password" || k == "uuid" || k == "public_key" || k == "private_key" || k == "username" || k == "id" || k == "pass" || k == "publicKey" || k == "privateKey" || k == "shortId" {
 					if text, ok := v.(string); ok && len(text) >= 4 {
 						result = append(result, text)
 					}

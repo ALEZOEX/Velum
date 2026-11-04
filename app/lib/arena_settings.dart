@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'client.dart';
+import 'network_mode_control.dart';
 import 'arena_icons.dart';
 
 class ArenaSettings extends StatefulWidget {
@@ -72,6 +73,12 @@ class _ArenaSettingsState extends State<ArenaSettings> {
     ('diamonds', 'Ромбы'),
     ('triangles', 'Треугольники'),
     ('crosses', 'Крестики'),
+    ('orbital', 'Орбиты'),
+    ('silk', 'Шёлковые волны'),
+    ('prism', 'Призма'),
+    ('starmap', 'Звёздная карта'),
+    ('bloom', 'Лепестки'),
+    ('interference', 'Интерференция'),
   ];
 
   Future<void> save(Map<String, dynamic> patch) async {
@@ -164,13 +171,11 @@ class _ArenaSettingsState extends State<ArenaSettings> {
           Icons.hub_outlined,
           'Режим работы',
           client.settings['mode'] == 'tun'
-              ? 'Только виртуальный адаптер TUN'
-              : 'Только локальные порты SOCKS5 / HTTP',
-          trailing: select(
-            client.settings['mode'] as String? ?? 'proxy',
-            const {'proxy': 'SOCKS5', 'tun': 'TUN'},
-            locked ? null : (value) => save({'mode': value}),
-          ),
+              ? client.tunAllowed
+                    ? 'Трафик системы с учётом правил'
+                    : 'Для TUN требуется системная служба'
+              : 'Системный трафик не перенаправляется',
+          trailing: NetworkModeControl(client: client, compact: true),
           accent: true,
         ),
         row(
@@ -553,6 +558,17 @@ class _ArenaSettingsState extends State<ArenaSettings> {
   );
 
   List<Widget> themeScreen() => [
+    const SizedBox(height: 16),
+    row(
+      Icons.brightness_6_outlined,
+      'Режим темы',
+      null,
+      trailing: select(client.settings['theme'] as String? ?? 'system', const {
+        'system': 'Системная',
+        'dark': 'Тёмная',
+        'light': 'Светлая',
+      }, (v) => save({'theme': v})),
+    ),
     card(
       Padding(
         padding: const EdgeInsets.all(16),
@@ -762,17 +778,6 @@ class _ArenaSettingsState extends State<ArenaSettings> {
           ],
         ),
       ),
-    ),
-    const SizedBox(height: 16),
-    row(
-      Icons.brightness_6_outlined,
-      'Режим темы',
-      null,
-      trailing: select(client.settings['theme'] as String? ?? 'system', const {
-        'system': 'Системная',
-        'dark': 'Тёмная',
-        'light': 'Светлая',
-      }, (v) => save({'theme': v})),
     ),
   ];
 

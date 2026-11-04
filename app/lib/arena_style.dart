@@ -168,7 +168,7 @@ class _ArenaPattern extends CustomPainter {
       alpha: .14,
     );
     canvas.drawCircle(Offset(size.width - 134, size.height - 118), 230, glow);
-    if (pattern != 'aurora-clean') {
+    if (pattern != 'aurora-clean' && !_drawComposition(canvas, size)) {
       final paint = Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.15
@@ -316,6 +316,133 @@ class _ArenaPattern extends CustomPainter {
         ).createShader(bounds)
         ..color = Colors.white.withValues(alpha: .65),
     );
+  }
+
+  bool _drawComposition(Canvas canvas, Size size) {
+    if (!const {
+      'orbital',
+      'silk',
+      'prism',
+      'starmap',
+      'bloom',
+      'interference',
+    }.contains(pattern)) {
+      return false;
+    }
+    final alpha = intensity.clamp(0, 100) / 100;
+    final line = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = colors.secondary.withValues(alpha: .30 * alpha);
+    final accent = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = colors.primary.withValues(alpha: .24 * alpha);
+    final center = Offset(size.width * .53, size.height * .48);
+    final span = math.max(size.width, size.height);
+    if (pattern == 'orbital') {
+      canvas.save();
+      canvas.translate(center.dx, center.dy);
+      canvas.rotate(-.35);
+      for (var i = 0; i < 8; i++) {
+        final radius = span * (.19 + i * .065);
+        canvas.drawOval(
+          Rect.fromCenter(
+            center: Offset.zero,
+            width: radius * 2,
+            height: radius * .68,
+          ),
+          i % 3 == 0 ? accent : line,
+        );
+        final angle = i * 2.37;
+        canvas.drawCircle(
+          Offset(math.cos(angle) * radius, math.sin(angle) * radius * .34),
+          2.1,
+          Paint()..color = colors.primary.withValues(alpha: .48 * alpha),
+        );
+      }
+      canvas.restore();
+    } else if (pattern == 'silk') {
+      for (var band = 0; band < 18; band++) {
+        final path = Path();
+        for (var x = 0.0; x <= size.width + 8; x += 8) {
+          final y =
+              size.height * .16 +
+              band * 24 +
+              math.sin(x / 190 + band * .12) * 58 +
+              math.sin(x / 83 + band * .08) * 12;
+          if (x == 0) {
+            path.moveTo(x, y);
+          } else {
+            path.lineTo(x, y);
+          }
+        }
+        canvas.drawPath(path, band % 6 == 0 ? accent : line);
+      }
+    } else if (pattern == 'prism') {
+      for (var i = 0; i < 9; i++) {
+        final offset = i * 52.0;
+        final path = Path()
+          ..moveTo(-80 + offset, size.height)
+          ..lineTo(size.width * .52 + offset * .25, size.height * .12)
+          ..lineTo(size.width + 80 - offset * .5, size.height * .72);
+        canvas.drawPath(path, i % 3 == 0 ? accent : line);
+      }
+    } else if (pattern == 'starmap') {
+      final points = <Offset>[];
+      for (var i = 0; i < 46; i++) {
+        final x = ((i * 137 + 41) % 997) / 997 * size.width;
+        final y = ((i * 263 + 73) % 991) / 991 * size.height;
+        points.add(Offset(x, y));
+      }
+      for (var i = 0; i < points.length; i++) {
+        for (var j = i + 1; j < points.length; j++) {
+          final d = (points[i] - points[j]).distance;
+          if (d > 20 && d < 105 && (i + j) % 3 == 0) {
+            canvas.drawLine(
+              points[i],
+              points[j],
+              line..color = colors.secondary.withValues(alpha: .16 * alpha),
+            );
+          }
+        }
+        canvas.drawCircle(
+          points[i],
+          i % 5 == 0 ? 2.2 : 1.2,
+          Paint()
+            ..color = (i % 5 == 0 ? colors.primary : colors.secondary)
+                .withValues(alpha: .48 * alpha),
+        );
+      }
+    } else if (pattern == 'bloom') {
+      canvas.save();
+      canvas.translate(center.dx, center.dy);
+      final radius = math.min(size.width, size.height) * .42;
+      for (var petal = 0; petal < 12; petal++) {
+        canvas.save();
+        canvas.rotate(petal * math.pi / 6);
+        for (var layer = 0; layer < 4; layer++) {
+          final r = radius * (.55 + layer * .15);
+          final path = Path()
+            ..moveTo(0, 0)
+            ..cubicTo(r * .28, -r * .28, r * .3, -r * .76, 0, -r)
+            ..cubicTo(-r * .3, -r * .76, -r * .28, -r * .28, 0, 0);
+          canvas.drawPath(path, layer == 3 ? accent : line);
+        }
+        canvas.restore();
+      }
+      canvas.restore();
+    } else {
+      for (final origin in [
+        Offset(size.width * .18, size.height * .33),
+        Offset(size.width * .82, size.height * .68),
+      ]) {
+        for (var radius = 45.0; radius < span * 1.1; radius += 24) {
+          canvas.drawCircle(origin, radius, radius % 72 < 1 ? accent : line);
+        }
+      }
+    }
+    return true;
   }
 
   @override

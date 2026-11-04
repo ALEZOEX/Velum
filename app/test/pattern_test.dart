@@ -56,7 +56,18 @@ void main() {
         await render('aurora-clean', 0),
         equals(await render('aurora-clean', 100)),
       );
-      for (final pattern in ['rings', 'diamonds', 'triangles', 'crosses']) {
+      for (final pattern in [
+        'rings',
+        'diamonds',
+        'triangles',
+        'crosses',
+        'orbital',
+        'silk',
+        'prism',
+        'starmap',
+        'bloom',
+        'interference',
+      ]) {
         expect(
           await render(pattern, 100),
           isNot(equals(hidden)),
@@ -77,6 +88,18 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Тема оформления'));
     await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(find.text('Режим темы')).dy,
+      lessThan(tester.getTopLeft(find.text('Фоновый узор и градиенты')).dy),
+    );
+    await tester.ensureVisible(find.text('Орбиты'));
+    await tester.tap(find.text('Орбиты'));
+    await tester.pumpAndSettle();
+    expect(client.settings['patternId'], 'orbital');
+    expect(
+      tester.widget<ArenaBackdrop>(find.byType(ArenaBackdrop)).patternId,
+      'orbital',
+    );
     await tester.ensureVisible(find.byType(Slider));
     await tester.pumpAndSettle();
     expect(find.textContaining('Яркость узора:'), findsOneWidget);
@@ -98,7 +121,18 @@ void main() {
     final directory = await Directory.systemTemp.createTemp('velum-pattern-');
     final client = VelumClient(directory: directory);
     try {
-      for (final pattern in ['rings', 'diamonds', 'triangles', 'crosses']) {
+      for (final pattern in [
+        'rings',
+        'diamonds',
+        'triangles',
+        'crosses',
+        'orbital',
+        'silk',
+        'prism',
+        'starmap',
+        'bloom',
+        'interference',
+      ]) {
         await client.saveSettings({
           'patternId': pattern,
           'patternIntensity': 100,
@@ -107,7 +141,7 @@ void main() {
       final restored = VelumClient(directory: directory);
       try {
         await restored.initialize();
-        expect(restored.settings['patternId'], 'crosses');
+        expect(restored.settings['patternId'], 'interference');
         expect(restored.settings['patternIntensity'], 100);
       } finally {
         restored.dispose();

@@ -22,6 +22,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / 'bin/sing-box'
 DAEMON = ROOT / 'bin/velumd'
+XRAY = ROOT / 'bin/xray'
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -125,6 +126,24 @@ def peer(folder):
             time.sleep(.3)
             if process.poll() is not None:
                 raise RuntimeError((folder / 'server.log').read_text())
+            xray_cfg = {
+                'log': {'loglevel': 'debug'},
+                'inbounds': [{'listen': '198.18.0.2', 'port': 8445, 'protocol': 'vless',
+                    'settings': {'clients': [{'id': '00000000-0000-4000-8000-000000000001'}], 'decryption': 'none'},
+                    'streamSettings': {'network': 'xhttp', 'security': 'reality',
+                        'realitySettings': {'dest': '127.0.0.1:9443', 'serverNames': ['localhost'],
+                            'privateKey': (folder / 'reality-private').read_text(), 'shortIds': ['abcd']},
+                        'xhttpSettings': {'path': '/xhttp-test', 'mode': 'auto'}}}],
+                'outbounds': [{'protocol': 'freedom', 'tag': 'direct', 'settings': {'finalRules': [{'action': 'allow', 'ip': ['198.19.0.0/24', 'fd00:19::/64', '1.1.1.1/32']}]}}],
+            }
+            xray_path = folder / 'xray-server.json'
+            xray_path.write_text(json.dumps(xray_cfg))
+            with (folder / 'xray-server.log').open('w') as xray_log:
+                xray_server = subprocess.Popen([str(XRAY), 'run', '-c', str(xray_path)], stdout=xray_log, stderr=xray_log)
+                processes.append(xray_server)
+                time.sleep(.3)
+                if xray_server.poll() is not None:
+                    raise RuntimeError((folder / 'xray-server.log').read_text())
             (folder / 'peer-ready').touch()
             process.wait()
     finally:
@@ -170,7 +189,7 @@ def isolated():
             token_path.chmod(0o600)
             env = dict(os.environ, SSL_CERT_FILE=str(folder / 'cert.pem'), DBUS_SYSTEM_BUS_ADDRESS='unix:path=/nonexistent-velum-lab-bus')
             with (folder / 'daemon.log').open('w') as log:
-                daemon = subprocess.Popen([str(DAEMON), '--tun', '--interface', 'lab0', '--core', str(CORE), '--token-file', str(token_path)], env=env, stdout=log, stderr=log)
+                daemon = subprocess.Popen([str(DAEMON), '--tun', '--interface', 'lab0', '--core', str(CORE), '--xray', str(XRAY), '--token-file', str(token_path)], env=env, stdout=log, stderr=log)
             def api(path, body=None):
                 req = urllib.request.Request('http://127.0.0.1:27841/v1/' + path, data=None if body is None else json.dumps(body).encode(), headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
                 with HTTP.open(req, timeout=20) as response:
@@ -209,8 +228,18 @@ def isolated():
             vless = f'vless://00000000-0000-4000-8000-000000000001@198.18.0.2:8444?security=reality&type=tcp&sni=localhost&pbk={public}&sid=abcd&flow=xtls-rprx-vision'
             assert api('connect', {'uri': vless})['state'] == 'running'
             with HTTP.open('http://198.19.0.2:8080/vless', timeout=8) as response:
-                assert json.load(response)['peer'] == '198.19.0.2'
+                proof = json.load(response)
+                assert proof['peer'] == '198.19.0.2', proof
             print('PASS VLESS Reality + Vision: actual TUN HTTP egress verified', flush=True)
+
+            assert api('disconnect', {})['state'] == 'disconnected'
+            wait_for(lambda: 'velum0' not in run('ip', '-j', 'link'))
+            xhttp = f'vless://00000000-0000-4000-8000-000000000001@198.18.0.2:8445?security=reality&type=xhttp&sni=localhost&pbk={public}&sid=abcd&path=%2Fxhttp-test&mode=auto&fp=chrome'
+            assert api('connect', {'uri': xhttp})['state'] == 'running'
+            with HTTP.open('http://198.19.0.2:8080/xhttp', timeout=12) as response:
+                proof = json.load(response)
+                assert proof['peer'] == '198.19.0.2', proof
+            print('PASS VLESS XHTTP + Reality: real Xray bridge and TUN HTTP egress verified', flush=True)
 
             daemon.terminate()
             daemon.wait(timeout=10)
@@ -219,6 +248,10 @@ def isolated():
                 assert run('ip', version, 'rule') == baseline[version]
             print('PASS SIGTERM: child stopped, TUN and policy rules removed', flush=True)
         except Exception:
+            try:
+                print('Core diagnostic entries:', json.dumps(api('logs')), file=sys.stderr)
+            except Exception:
+                pass
             for proc in Path('/proc').iterdir():
                 if not proc.name.isdigit(): continue
                 try:
@@ -228,7 +261,7 @@ def isolated():
                 except (OSError, PermissionError): pass
             print('Links at failure:', run('ip', '-j', 'link'), file=sys.stderr)
             print('Rules at failure:', run('ip', 'rule'), file=sys.stderr)
-            for name in ('daemon.log', 'server.log'):
+            for name in ('daemon.log', 'server.log', 'xray-server.log'):
                 path = folder / name
                 if path.exists():
                     print(f'{name}:\n{path.read_text()[-6000:]}', file=sys.stderr)
@@ -244,6 +277,8 @@ if __name__ == '__main__':
     elif len(sys.argv) == 3 and sys.argv[1] == '--peer':
         peer(Path(sys.argv[2]))
     else:
+        if not XRAY.is_file():
+            raise SystemExit('Build the pinned Xray companion first: make xray')
         if sys.platform != 'linux':
             raise SystemExit('This test requires Linux')
         subprocess.run(['unshare', '--user', '--map-root-user', '--net', sys.executable, str(Path(__file__).resolve()), '--isolated'], check=True, timeout=90)

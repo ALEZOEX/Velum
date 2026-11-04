@@ -79,6 +79,7 @@ class VelumClient extends ChangeNotifier {
   Future<void> _writes = Future<void>.value();
   File get _file => File('${directory.path}/profiles.json');
   bool get verified => status['verified'] == true;
+  bool get tunAllowed => state != 'offline' && status['tunAllowed'] == true;
   int? get latencyMs => status['latencyMs'] as int?;
   int get uptimeSeconds => status['uptimeSeconds'] as int? ?? 0;
   DateTime? get connectedAt =>
@@ -976,6 +977,12 @@ class VelumClient extends ChangeNotifier {
           'diamonds',
           'triangles',
           'crosses',
+          'orbital',
+          'silk',
+          'prism',
+          'starmap',
+          'bloom',
+          'interference',
         ].contains(value['patternId']) ||
         value['patternIntensity'] is! int ||
         (value['patternIntensity'] as int) < 0 ||

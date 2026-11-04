@@ -150,6 +150,10 @@ func buildConfig(raw string, tun bool, interfaceName string, s ConnectionSetting
 	if err = resolveEndpoint(out); err != nil {
 		return nil, err
 	}
+	return buildConfigWithOutbound(out, tun, interfaceName, s)
+}
+
+func buildConfigWithOutbound(out map[string]any, tun bool, interfaceName string, s ConnectionSettings) (map[string]any, error) {
 	if s.MTU == 0 {
 		s.MTU = 1400
 	}

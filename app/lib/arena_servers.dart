@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'client.dart';
 import 'arena_icons.dart';
+import 'rotating_refresh.dart';
 
 class ArenaServers extends StatefulWidget {
   const ArenaServers({
@@ -395,6 +396,7 @@ class _ArenaServersState extends State<ArenaServers> {
                   client.updatingSubscriptions.contains(sub.id)
                       ? null
                       : () => act(() => client.updateSubscription(sub.id)),
+                  rotating: client.updatingSubscriptions.contains(sub.id),
                 ),
                 const SizedBox(width: 6),
               ],
@@ -459,6 +461,7 @@ class _ArenaServersState extends State<ArenaServers> {
     String tooltip,
     VoidCallback? callback, {
     bool highlighted = false,
+    bool rotating = false,
   }) => SizedBox(
     width: 32,
     height: 32,
@@ -470,12 +473,15 @@ class _ArenaServersState extends State<ArenaServers> {
         backgroundColor: Colors.white.withValues(alpha: .05),
         side: BorderSide(color: Colors.white.withValues(alpha: .10)),
       ),
-      icon: ArenaGlyph(
-        icon,
-        size: 14,
-        color: highlighted
-            ? Theme.of(context).colorScheme.primary
-            : Theme.of(context).colorScheme.onSurface,
+      icon: RotatingRefresh(
+        active: rotating,
+        child: ArenaGlyph(
+          icon,
+          size: 14,
+          color: highlighted
+              ? Theme.of(context).colorScheme.primary
+              : Theme.of(context).colorScheme.onSurface,
+        ),
       ),
     ),
   );
