@@ -37,6 +37,7 @@ dependencies:
   file_selector: ^1.1.0
   flutter_svg: ^2.3.2
   qr_flutter: ^4.1.0
+  tray_manager: ^0.8.2
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -60,6 +61,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/icons/
+    - assets/tray/
     - assets/fonts/
   fonts:
     - family: ArenaSans

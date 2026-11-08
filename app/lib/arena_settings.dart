@@ -104,6 +104,52 @@ class _ArenaSettingsState extends State<ArenaSettings> {
     widget.onAppearanceChanged?.call(patch);
   }
 
+  String _systemProxySubtitle() {
+    if (!client.systemProxySupported) {
+      return 'Не поддерживается (${client.systemProxyEnvironment})';
+    }
+    final port = client.settings['proxyPort'] ?? 2080;
+    final vpnConnected = client.running;
+    final localProxyActive = client.proxyInboundActive;
+
+    switch (client.systemProxyStatus) {
+      case SystemProxyStatus.enabled:
+        if (vpnConnected && localProxyActive) {
+          return 'Применен в ОС (127.0.0.1:$port) · Локальный порт активен · VPN подключен';
+        } else if (localProxyActive) {
+          return 'Применен в ОС (127.0.0.1:$port) · Локальный порт активен · VPN не подключен';
+        } else {
+          return 'Применен в ОС (127.0.0.1:$port) · VPN и локальный прокси не запущены';
+        }
+      case SystemProxyStatus.conflict:
+        return 'Конфликт: системный прокси в ОС изменен сторонней программой';
+      case SystemProxyStatus.error:
+        return 'Ошибка чтения/записи настроек ОС';
+      case SystemProxyStatus.disabled:
+        if (client.settings['systemProxy'] == true) {
+          return vpnConnected
+              ? 'Выключен в ОС (проверьте подключение)'
+              : 'Выключен в ОС · активируется автоматически при старте VPN';
+        }
+        return 'Выключен в ОС · системный трафик не перенаправляется';
+      case SystemProxyStatus.unsupported:
+        return 'Не поддерживается в текущем окружении';
+    }
+  }
+
+  Future<void> _toggleSystemProxy(bool enable) async {
+    try {
+      await client.setSystemProxyEnabled(enable);
+      if (mounted) setState(() {});
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка настройки прокси: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) => Align(
     alignment: Alignment.topCenter,
@@ -258,11 +304,71 @@ class _ArenaSettingsState extends State<ArenaSettings> {
             ),
           ],
         ),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            row(
+              Icons.language,
+              'Системный прокси',
+              _systemProxySubtitle(),
+              trailing: toggle(
+                client.settings['systemProxy'] == true,
+                !client.systemProxySupported
+                    ? null
+                    : (v) => _toggleSystemProxy(v),
+              ),
+              iconColor: client.settings['systemProxy'] == true
+                  ? acid
+                  : (client.systemProxyStatus == SystemProxyStatus.conflict
+                      ? const Color(0xfff59e0b)
+                      : null),
+            ),
+            if (client.settings['systemProxy'] == true &&
+                client.systemProxyStatus == SystemProxyStatus.conflict)
+              Padding(
+                padding: const EdgeInsets.only(left: 48, right: 16, bottom: 8),
+                child: Text(
+                  'Внимание: системные настройки прокси были изменены сторонней программой.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: const Color(0xfff59e0b).withValues(alpha: .9),
+                  ),
+                ),
+              ),
+            if (client.systemProxyStatus == SystemProxyStatus.enabled &&
+                !client.running)
+              Padding(
+                padding: const EdgeInsets.only(left: 48, right: 16, bottom: 8),
+                child: Text(
+                  'Внимание: системный прокси активен, но VPN не подключен. Сайты станут доступны после подключения к серверу.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: const Color(0xfff59e0b).withValues(alpha: .9),
+                  ),
+                ),
+              ),
+            if (!client.systemProxySupported &&
+                client.systemProxyUnsupportedReason.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(left: 48, right: 16, bottom: 8),
+                child: Text(
+                  client.systemProxyUnsupportedReason,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.white.withValues(alpha: .5),
+                  ),
+                ),
+              ),
+          ],
+        ),
         row(
-          Icons.desktop_windows_outlined,
-          'Запускать с системой',
-          'Системный трей и автозапуск пока не реализованы',
-          trailing: toggle(false, null),
+          Icons.vertical_align_bottom_outlined,
+          'Сворачивать в системный трей',
+          'При закрытии окно сворачивается в трей, а соединение остаётся активным',
+          trailing: toggle(
+            client.settings['minimizeToTray'] == true,
+            (v) => save({'minimizeToTray': v}),
+          ),
         ),
       ]),
       group('Туннель', [

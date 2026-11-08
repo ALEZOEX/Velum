@@ -232,7 +232,9 @@ func stopProcess(cmd *exec.Cmd, done chan struct{}) {
 	select {
 	case <-done:
 	case <-time.After(4 * time.Second):
-		_ = cmd.Process.Kill()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		<-done
 	}
 }

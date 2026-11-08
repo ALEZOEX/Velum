@@ -66,7 +66,9 @@ func (s *service) stopCore() {
 			select {
 			case <-s.done:
 			case <-time.After(4 * time.Second):
-				_ = s.cmd.Process.Kill()
+				if s.cmd.Process != nil {
+					_ = s.cmd.Process.Kill()
+				}
 				<-s.done
 			}
 		}
@@ -667,7 +669,11 @@ func prepareDaemon(cfg daemonConfig) (*daemonRuntime, error) {
 	}
 	managedBy := cfg.managedBy
 	if managedBy == "" {
-		managedBy = "console"
+		if os.Getenv("INVOCATION_ID") != "" || os.Getenv("JOURNAL_STREAM") != "" {
+			managedBy = "systemd"
+		} else {
+			managedBy = "console"
+		}
 	}
 	s := &service{xray: cfg.xray, core: cfg.core, interfaceName: cfg.interfaceName, tun: cfg.tunAllowed, dir: dir, token: token, state: "disconnected", serviceMode: managedBy}
 	listener, err := net.Listen("tcp4", "127.0.0.1:27841")

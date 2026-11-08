@@ -21,6 +21,7 @@ if [[ -f $unit_path ]]; then
   systemctl disable --now velum.service
 fi
 rm -f -- "$unit_path" "$config_path/token"
+rm -f -- /usr/share/polkit-1/actions/app.velum.service.policy
 rm -rf -- "$install_dir"
 if [[ -d $config_path ]]; then rmdir -- "$config_path" 2>/dev/null || true; fi
 systemctl daemon-reload

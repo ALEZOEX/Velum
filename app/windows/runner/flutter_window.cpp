@@ -8,6 +8,8 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+static bool g_hide_on_close = false;
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -48,7 +50,26 @@ bool FlutterWindow::OnCreate() {
         } else if (*method == "maximize") {
           ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
         } else if (*method == "close") {
-          PostMessage(window, WM_CLOSE, 0, 0);
+          if (g_hide_on_close) {
+            ShowWindow(window, SW_HIDE);
+          } else {
+            PostMessage(window, WM_CLOSE, 0, 0);
+          }
+        } else if (*method == "hide") {
+          ShowWindow(window, SW_HIDE);
+        } else if (*method == "show") {
+          ShowWindow(window, SW_RESTORE);
+          SetForegroundWindow(window);
+        } else if (*method == "isVisible") {
+          bool visible = IsWindowVisible(window) != FALSE;
+          result->Success(flutter::EncodableValue(visible));
+          return;
+        } else if (*method == "setHideOnClose") {
+          if (call.arguments()) {
+            if (const auto* val = std::get_if<bool>(call.arguments())) {
+              g_hide_on_close = *val;
+            }
+          }
         } else if (*method == "drag") {
           ReleaseCapture();
           SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
@@ -96,6 +117,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     if (result) {
       return *result;
     }
+  }
+
+  if (message == WM_CLOSE && g_hide_on_close) {
+    ShowWindow(hwnd, SW_HIDE);
+    return 0;
   }
 
   switch (message) {

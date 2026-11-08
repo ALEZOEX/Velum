@@ -16,24 +16,37 @@ import 'arena_import.dart';
 import 'arena_logs.dart';
 import 'arena_inspector.dart';
 import 'arena_icons.dart';
+import 'tray_service.dart';
 
 void main() => runApp(const VelumApp());
 
 class VelumApp extends StatefulWidget {
-  const VelumApp({super.key, this.client, this.initialize = true});
+  const VelumApp({
+    super.key,
+    this.client,
+    this.initialize = true,
+    this.trayService,
+  });
   final VelumClient? client;
   final bool initialize;
+  final VelumTrayService? trayService;
   @override
   State<VelumApp> createState() => _VelumAppState();
 }
 
 class _VelumAppState extends State<VelumApp> {
   late final VelumClient client = widget.client ?? VelumClient();
+  late final VelumTrayService trayService =
+      widget.trayService ?? VelumTrayService(client: client);
+
   @override
   void initState() {
     super.initState();
     client.addListener(update);
-    if (widget.initialize) unawaited(client.initialize());
+    if (widget.initialize) {
+      unawaited(client.initialize());
+      unawaited(trayService.initialize());
+    }
   }
 
   void update() {
@@ -43,6 +56,7 @@ class _VelumAppState extends State<VelumApp> {
   @override
   void dispose() {
     client.removeListener(update);
+    trayService.dispose();
     if (widget.client == null) client.dispose();
     super.dispose();
   }
@@ -60,7 +74,7 @@ class _VelumAppState extends State<VelumApp> {
     theme: theme(Brightness.light),
     darkTheme: theme(Brightness.dark),
     themeMode: ThemeMode.dark,
-    home: Home(client: client),
+    home: Home(client: client, trayService: trayService),
   );
 }
 
@@ -74,8 +88,9 @@ const pages = <(String, IconData)>[
 ];
 
 class Home extends StatefulWidget {
-  const Home({super.key, required this.client});
+  const Home({super.key, required this.client, this.trayService});
   final VelumClient client;
+  final VelumTrayService? trayService;
   @override
   State<Home> createState() => _HomeState();
 }
@@ -202,6 +217,10 @@ class _HomeState extends State<Home> {
   }
 
   Future<void> windowAction(String action) async {
+    if (action == 'close' && widget.trayService != null) {
+      await widget.trayService!.handleWindowClose();
+      return;
+    }
     try {
       await const MethodChannel('velum/window').invokeMethod<void>(action);
     } on MissingPluginException {

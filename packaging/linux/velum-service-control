@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+[[ $EUID == 0 ]] || { printf 'velum-service-control: root privileges required.\n' >&2; exit 1; }
+
+case "${1:-}" in
+  start)
+    systemctl start velum.service
+    ;;
+  stop)
+    systemctl stop velum.service
+    ;;
+  restart)
+    systemctl restart velum.service
+    ;;
+  status)
+    systemctl status velum.service --no-pager
+    ;;
+  uninstall)
+    if [[ -x /usr/local/lib/velum/uninstall-service.sh ]]; then
+      exec /usr/local/lib/velum/uninstall-service.sh
+    else
+      systemctl disable --now velum.service 2>/dev/null || true
+      rm -f /etc/systemd/system/velum.service /etc/velum/token
+      rm -f /usr/share/polkit-1/actions/app.velum.service.policy
+      rm -rf /usr/local/lib/velum
+      systemctl daemon-reload
+      systemctl reset-failed velum.service 2>/dev/null || true
+    fi
+    ;;
+  *)
+    printf 'Usage: velum-service-control {start|stop|restart|status|uninstall}\n' >&2
+    exit 2
+    ;;
+esac

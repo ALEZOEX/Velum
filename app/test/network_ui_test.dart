@@ -13,6 +13,10 @@ class ModeClient extends VelumClient {
     settings.addAll(value);
     notifyListeners();
   }
+
+  @override
+  Future<LinuxServiceState> checkLinuxServiceState() async =>
+      LinuxServiceState.notInstalled;
 }
 
 void main() {
@@ -113,6 +117,21 @@ void main() {
       find.textContaining('Системный трафик не перенаправляется'),
       findsOneWidget,
     );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    client.dispose();
+  });
+  testWidgets('Service management dialog shows Linux states', (tester) async {
+    final client = ModeClient()..state = 'disconnected';
+    await mount(tester, client);
+    await tester.tap(find.text('Как включить VPN для всей системы'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.textContaining('службой'), findsWidgets);
+    expect(find.text('Закрыть'), findsOneWidget);
+    await tester.tap(find.text('Закрыть'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
     client.dispose();

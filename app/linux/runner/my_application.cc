@@ -19,15 +19,46 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
+static gboolean g_hide_on_close = FALSE;
+
+static gboolean window_delete_event(GtkWidget* widget, GdkEvent* event, gpointer user_data) {
+  if (g_hide_on_close) {
+    gtk_widget_hide(widget);
+    return TRUE; // Intercept close and keep running in background
+  }
+  return FALSE;
+}
+
 static void window_method_call(FlMethodChannel* channel, FlMethodCall* call, gpointer user_data) {
   GtkWindow* window = GTK_WINDOW(user_data);
   const gchar* method = fl_method_call_get_name(call);
-  if (g_strcmp0(method, "minimize") == 0) gtk_window_iconify(window);
-  else if (g_strcmp0(method, "maximize") == 0) {
+  if (g_strcmp0(method, "minimize") == 0) {
+    gtk_window_iconify(window);
+  } else if (g_strcmp0(method, "maximize") == 0) {
     if (gtk_window_is_maximized(window)) gtk_window_unmaximize(window);
     else gtk_window_maximize(window);
-  } else if (g_strcmp0(method, "close") == 0) gtk_window_close(window);
-  else if (g_strcmp0(method, "drag") == 0) {
+  } else if (g_strcmp0(method, "close") == 0) {
+    if (g_hide_on_close) {
+      gtk_widget_hide(GTK_WIDGET(window));
+    } else {
+      gtk_window_close(window);
+    }
+  } else if (g_strcmp0(method, "hide") == 0) {
+    gtk_widget_hide(GTK_WIDGET(window));
+  } else if (g_strcmp0(method, "show") == 0) {
+    gtk_widget_show(GTK_WIDGET(window));
+    gtk_window_present(window);
+  } else if (g_strcmp0(method, "isVisible") == 0) {
+    gboolean visible = gtk_widget_get_visible(GTK_WIDGET(window));
+    g_autoptr(FlValue) result = fl_value_new_bool(visible);
+    fl_method_call_respond_success(call, result, nullptr);
+    return;
+  } else if (g_strcmp0(method, "setHideOnClose") == 0) {
+    FlValue* args = fl_method_call_get_args(call);
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
+      g_hide_on_close = fl_value_get_bool(args);
+    }
+  } else if (g_strcmp0(method, "drag") == 0) {
     GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
     GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
     gint x = 0, y = 0;
@@ -53,6 +84,7 @@ static void my_application_activate(GApplication* application) {
   minimum.min_width = 440;
   minimum.min_height = 640;
   gtk_window_set_geometry_hints(window, nullptr, &minimum, GDK_HINT_MIN_SIZE);
+  g_signal_connect(window, "delete-event", G_CALLBACK(window_delete_event), nullptr);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(

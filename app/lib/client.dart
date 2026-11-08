@@ -7,7 +7,9 @@ import 'package:flutter/foundation.dart';
 
 import 'imports.dart';
 import 'models.dart';
+import 'system_proxy.dart';
 export 'models.dart';
+export 'system_proxy.dart';
 
 const defaultSettings = <String, dynamic>{
   'theme': 'system',
@@ -46,17 +48,36 @@ const _networkKeys = {
   'interface',
 };
 
+enum LinuxServiceState {
+  notInstalled,
+  installedStopped,
+  running,
+  unavailable,
+  checkError,
+}
+
 class VelumClient extends ChangeNotifier {
-  VelumClient({Directory? directory, Uri? apiBase})
-    : directory =
-          directory ??
-          Directory(
-            Platform.environment['VELUM_CONFIG_DIR'] ??
-                '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
-          ),
-      apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
+  VelumClient({
+    Directory? directory,
+    Uri? apiBase,
+    this.proxyManager,
+  })  : directory =
+            directory ??
+            Directory(
+              Platform.environment['VELUM_CONFIG_DIR'] ??
+                  '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
+            ),
+        apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
+
   final Directory directory;
   final Uri apiBase;
+  SystemProxyManager? proxyManager;
+  SystemProxyStatus systemProxyStatus = SystemProxyStatus.disabled;
+
+  bool get systemProxySupported => proxyManager?.isSupported ?? false;
+  String get systemProxyUnsupportedReason =>
+      proxyManager?.unsupportedReason ?? '';
+  String get systemProxyEnvironment => proxyManager?.environmentName ?? '';
   final List<Profile> profiles = [];
   final List<Subscription> subscriptions = [];
   final Set<String> updatingSubscriptions = {};
@@ -92,10 +113,12 @@ class VelumClient extends ChangeNotifier {
   }
 
   bool get running => state == 'running';
+  bool get proxyInboundActive => running && (mode == 'proxy' || mode.isEmpty);
   String get engineState =>
       status['engineState'] as String? ?? (running ? 'running' : 'stopped');
   String get serviceMode => status['serviceMode'] as String? ?? 'console';
-  bool get managedByService => serviceMode == 'windows-service';
+  bool get managedByService =>
+      serviceMode == 'windows-service' || serviceMode == 'systemd';
   bool get verified => status['verified'] == true;
   bool get tunAllowed => state != 'offline' && status['tunAllowed'] == true;
   int? get latencyMs => status['latencyMs'] as int?;
@@ -143,6 +166,9 @@ class VelumClient extends ChangeNotifier {
           'Не удалось прочитать локальные профили. Проверьте каталог Velum.';
       _storageError = message;
     }
+    if (Platform.isLinux || Platform.isMacOS) {
+      await _ensureClientToken();
+    }
     try {
       _token = (await _tokenFile.readAsString()).trim();
     } catch (_) {
@@ -150,7 +176,22 @@ class VelumClient extends ChangeNotifier {
         message = 'Служба ещё не настроена. Выполните scripts/init-client.py.';
       }
     }
+    proxyManager ??= await createSystemProxyManager(configDirectory: directory);
     await refresh();
+    try {
+      final proxyPort = settings['proxyPort'] as int? ?? 2080;
+      final isVpnRunning = (state == 'running');
+      final userWantsProxy = (settings['systemProxy'] == true);
+      final inboundActive = await isProxyInboundListening(proxyPort);
+      await proxyManager!.recoverIfOrphaned(
+        host: '127.0.0.1',
+        port: proxyPort,
+        isVpnRunning: isVpnRunning,
+        isProxyInboundActive: inboundActive,
+        userWantsProxy: userWantsProxy,
+      );
+    } catch (_) {}
+    await refreshSystemProxyStatus();
     _timer?.cancel();
     _subscriptionTimer?.cancel();
     _timer = Timer.periodic(
@@ -1101,6 +1142,15 @@ class VelumClient extends ChangeNotifier {
     _polling = true;
     try {
       _apply(await _request('status'));
+      if (proxyManager != null && proxyManager!.isSupported) {
+        final proxyPort = settings['proxyPort'] as int? ?? 2080;
+        final newStatus =
+            await proxyManager!.getStatus('127.0.0.1', proxyPort);
+        if (newStatus != systemProxyStatus) {
+          systemProxyStatus = newStatus;
+          notifyListeners();
+        }
+      }
     } catch (_) {
       state = 'offline';
     } finally {
@@ -1110,12 +1160,87 @@ class VelumClient extends ChangeNotifier {
   }
 
   void _apply(Map<String, dynamic> data) {
+    final previousState = state;
     status = data;
     state = data['state'] as String? ?? 'offline';
     mode = data['mode'] as String? ?? '';
     message = _storageError.isEmpty
         ? data['error'] as String? ?? ''
         : _storageError;
+
+    _handleStateTransition(previousState, state);
+  }
+
+  Future<void> _handleStateTransition(String from, String to) async {
+    if (from == to || proxyManager == null || !proxyManager!.isSupported) {
+      return;
+    }
+    final proxyPort = settings['proxyPort'] as int? ?? 2080;
+    if (to == 'running') {
+      if (settings['systemProxy'] == true && mode != 'tun') {
+        try {
+          await proxyManager!.enable(host: '127.0.0.1', port: proxyPort);
+        } catch (_) {}
+        await refreshSystemProxyStatus();
+      }
+    } else if (from == 'running') {
+      if (settings['systemProxy'] == true) {
+        try {
+          await proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
+        } catch (_) {}
+        await refreshSystemProxyStatus();
+      }
+    }
+  }
+
+  Future<void> refreshSystemProxyStatus() async {
+    if (proxyManager == null) return;
+    if (!proxyManager!.isSupported) {
+      systemProxyStatus = SystemProxyStatus.unsupported;
+      notifyListeners();
+      return;
+    }
+    final proxyPort = settings['proxyPort'] as int? ?? 2080;
+    systemProxyStatus = await proxyManager!.getStatus('127.0.0.1', proxyPort);
+    notifyListeners();
+  }
+
+  Future<void> setSystemProxyEnabled(bool enabled) async {
+    await saveSettings({'systemProxy': enabled});
+    if (proxyManager == null || !proxyManager!.isSupported) {
+      await refreshSystemProxyStatus();
+      return;
+    }
+    final proxyPort = settings['proxyPort'] as int? ?? 2080;
+    if (enabled) {
+      if (state == 'running' && mode != 'tun') {
+        try {
+          await proxyManager!.enable(host: '127.0.0.1', port: proxyPort);
+        } catch (e) {
+          message = 'Не удалось включить системный прокси: $e';
+        }
+      }
+    } else {
+      try {
+        await proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
+      } catch (e) {
+        message = 'Не удалось восстановить системный прокси: $e';
+      }
+    }
+    await refreshSystemProxyStatus();
+  }
+
+  /// Probes whether a local TCP listener is actively accepting connections on the proxy port.
+  Future<bool> isProxyInboundListening([int? port]) async {
+    final targetPort = port ?? (settings['proxyPort'] as int? ?? 2080);
+    try {
+      final socket = await Socket.connect('127.0.0.1', targetPort,
+          timeout: const Duration(milliseconds: 300));
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> refreshLogs() async {
@@ -1208,6 +1333,217 @@ class VelumClient extends ChangeNotifier {
     await refresh();
   }
 
+  Future<void> _ensureClientToken() async {
+    final file = _tokenFile;
+    if (await file.exists()) {
+      try {
+        final content = (await file.readAsString()).trim();
+        if (content.length >= 32) {
+          _token = content;
+          return;
+        }
+      } catch (_) {}
+    }
+    final random = Random.secure();
+    final bytes = List<int>.generate(32, (_) => random.nextInt(256));
+    final tokenHex =
+        bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    try {
+      await _prepareDirectory();
+      await _privateWrite(file, utf8.encode('$tokenHex\n'));
+      _token = tokenHex;
+    } catch (_) {}
+  }
+
+  Future<LinuxServiceState> checkLinuxServiceState() async {
+    if (!Platform.isLinux) return LinuxServiceState.notInstalled;
+    try {
+      if (!await Directory('/run/systemd/system').exists()) {
+        return LinuxServiceState.checkError;
+      }
+      final unitFile = File('/etc/systemd/system/velum.service');
+      final hasUnit = await unitFile.exists();
+      if (!hasUnit) {
+        final listResult = await Process.run('systemctl', [
+          'list-unit-files',
+          'velum.service',
+        ]);
+        if (listResult.exitCode != 0 ||
+            !listResult.stdout.toString().contains('velum.service')) {
+          return LinuxServiceState.notInstalled;
+        }
+      }
+
+      final activeResult = await Process.run('systemctl', [
+        'is-active',
+        'velum.service',
+      ]);
+      final activeText = activeResult.stdout.toString().trim();
+      if (activeText == 'active') {
+        if (state != 'offline' && tunAllowed) {
+          return LinuxServiceState.running;
+        } else {
+          return LinuxServiceState.unavailable;
+        }
+      } else {
+        return LinuxServiceState.installedStopped;
+      }
+    } catch (_) {
+      return LinuxServiceState.checkError;
+    }
+  }
+
+  Future<ProcessResult> _runPrivilegedLinuxCommand(List<String> command) async {
+    final checkPkexec = await Process.run('which', ['pkexec']);
+    if (checkPkexec.exitCode != 0) {
+      throw const FormatException(
+        'Утилита pkexec не найдена в системе. Установите пакет polkit.',
+      );
+    }
+    try {
+      return await Process.run('pkexec', command);
+    } on ProcessException catch (e) {
+      throw FormatException('Ошибка запуска pkexec: ${e.message}');
+    }
+  }
+
+  Future<void> startLinuxService() async {
+    if (!Platform.isLinux) {
+      throw const FormatException('Действие доступно только на Linux.');
+    }
+    if (!await Directory('/run/systemd/system').exists()) {
+      throw const FormatException(
+        'В системе не обнаружен активный systemd. Служба Velum требует systemd.',
+      );
+    }
+
+    final controlScript = File('/usr/local/lib/velum/velum-service-control');
+    List<String> command;
+    if (await controlScript.exists()) {
+      command = [controlScript.path, 'start'];
+    } else {
+      command = ['systemctl', 'start', 'velum.service'];
+    }
+
+    final result = await _runPrivilegedLinuxCommand(command);
+    if (result.exitCode != 0) {
+      final stderr = result.stderr.toString().trim();
+      if (result.exitCode == 126 ||
+          stderr.contains('dismissed') ||
+          stderr.contains('canceled') ||
+          stderr.contains('cancelled')) {
+        throw const FormatException('Авторизация отменена пользователем.');
+      }
+      if (stderr.contains('No authentication agent found')) {
+        throw const FormatException(
+          'В графической сессии не найден Polkit Authentication Agent. '
+          'Запустите службу вручную в терминале: sudo systemctl start velum.service',
+        );
+      }
+      throw FormatException(
+        stderr.isEmpty
+            ? 'Не удалось запустить службу (код ${result.exitCode}).'
+            : 'Ошибка запуска службы: $stderr',
+      );
+    }
+
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (DateTime.now().isBefore(deadline)) {
+      await refresh();
+      if (state != 'offline' && tunAllowed) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+
+    throw const FormatException(
+      'Служба запущена, но API не ответило вовремя. Проверьте: journalctl -u velum.service',
+    );
+  }
+
+  Future<void> stopLinuxService() async {
+    if (!Platform.isLinux) {
+      throw const FormatException('Действие доступно только на Linux.');
+    }
+    final controlScript = File('/usr/local/lib/velum/velum-service-control');
+    List<String> command;
+    if (await controlScript.exists()) {
+      command = [controlScript.path, 'stop'];
+    } else {
+      command = ['systemctl', 'stop', 'velum.service'];
+    }
+
+    final result = await _runPrivilegedLinuxCommand(command);
+    if (result.exitCode != 0) {
+      final stderr = result.stderr.toString().trim();
+      if (result.exitCode == 126 || stderr.contains('dismissed')) {
+        throw const FormatException('Авторизация отменена пользователем.');
+      }
+      throw FormatException('Ошибка остановки службы: $stderr');
+    }
+
+    await refresh();
+  }
+
+  Future<void> uninstallLinuxService() async {
+    if (!Platform.isLinux) {
+      throw const FormatException('Действие доступно только на Linux.');
+    }
+    final controlScript = File('/usr/local/lib/velum/velum-service-control');
+    final uninstallScript = File('/usr/local/lib/velum/uninstall-service.sh');
+    List<String> command;
+    if (await controlScript.exists()) {
+      command = [controlScript.path, 'uninstall'];
+    } else if (await uninstallScript.exists()) {
+      command = [uninstallScript.path];
+    } else {
+      command = ['systemctl', 'disable', '--now', 'velum.service'];
+    }
+
+    final result = await _runPrivilegedLinuxCommand(command);
+    if (result.exitCode != 0) {
+      final stderr = result.stderr.toString().trim();
+      if (result.exitCode == 126 || stderr.contains('dismissed')) {
+        throw const FormatException('Авторизация отменена пользователем.');
+      }
+      throw FormatException('Ошибка удаления службы: $stderr');
+    }
+
+    await refresh();
+  }
+
+  Future<void> installLinuxService() async {
+    if (!Platform.isLinux) {
+      throw const FormatException('Действие доступно только на Linux.');
+    }
+    if (!await Directory('/run/systemd/system').exists()) {
+      throw const FormatException(
+        'В системе не обнаружен активный systemd. Служба Velum требует systemd.',
+      );
+    }
+    await _ensureClientToken();
+
+    final trustedInstaller = File('/usr/local/lib/velum/install-service.sh');
+    if (await trustedInstaller.exists()) {
+      final user = Platform.environment['USER'] ?? '';
+      final result = await _runPrivilegedLinuxCommand([
+        trustedInstaller.path,
+        if (user.isNotEmpty) ...['--user', user],
+      ]);
+      if (result.exitCode != 0) {
+        final stderr = result.stderr.toString().trim();
+        if (result.exitCode == 126 || stderr.contains('dismissed')) {
+          throw const FormatException('Авторизация отменена пользователем.');
+        }
+        throw FormatException('Ошибка установки службы: $stderr');
+      }
+      await refresh();
+      return;
+    }
+
+    throw const FormatException('trusted-installer-required');
+  }
+
   List<int> _utf16le(String value) {
     final bytes = <int>[];
     for (final unit in value.codeUnits) {
@@ -1243,6 +1579,10 @@ class VelumClient extends ChangeNotifier {
     _disposed = true;
     _timer?.cancel();
     _subscriptionTimer?.cancel();
+    if (state == 'running' && settings['systemProxy'] == true) {
+      final proxyPort = settings['proxyPort'] as int? ?? 2080;
+      proxyManager?.restore(host: '127.0.0.1', port: proxyPort).ignore();
+    }
     super.dispose();
   }
 }

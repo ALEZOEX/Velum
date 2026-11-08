@@ -149,6 +149,13 @@ if [[ -f $bin_dir/xray ]]; then
   install -m 0755 -o root -g root "$bin_dir/xray" "$stage/xray"
   xray_arg=' --xray /usr/local/lib/velum/xray'
 fi
+install -m 0755 -o root -g root "${BASH_SOURCE[0]}" "$stage/install-service.sh"
+if [[ -f "$project_dir/scripts/uninstall-linux-service.sh" ]]; then
+  install -m 0755 -o root -g root "$project_dir/scripts/uninstall-linux-service.sh" "$stage/uninstall-service.sh"
+fi
+if [[ -f "$project_dir/packaging/linux/velum-service-control" ]]; then
+  install -m 0755 -o root -g root "$project_dir/packaging/linux/velum-service-control" "$stage/velum-service-control"
+fi
 chmod 0755 "$stage"
 [[ ! -f $unit_path ]] || cp -p -- "$unit_path" "$backup/unit"
 [[ ! -f $config_path/token ]] || cp -p -- "$config_path/token" "$backup/token"
@@ -198,6 +205,9 @@ mv -- "$stage" "$install_dir"
 install -d -m 0700 -o root -g root "$config_path"
 validate_token "$config_path/token"
 install -m 0644 -o root -g root "$backup/new-unit" "$unit_path"
+if [[ -d /usr/share/polkit-1/actions && -f "$project_dir/packaging/linux/app.velum.service.policy" ]]; then
+  install -m 0644 -o root -g root "$project_dir/packaging/linux/app.velum.service.policy" /usr/share/polkit-1/actions/app.velum.service.policy
+fi
 systemctl daemon-reload
 if [[ $start_service == yes ]]; then
   systemctl enable velum.service

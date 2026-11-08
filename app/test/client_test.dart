@@ -32,4 +32,12 @@ void main() {
     expect(client.profiles, isEmpty);
     expect(await File('${directory.path}/profiles.json').exists(), isFalse);
   });
+  test('Token is automatically initialized on Linux if absent', () async {
+    expect(await File('${directory.path}/token').exists(), isFalse);
+    await client.initialize();
+    final tokenFile = File('${directory.path}/token');
+    expect(await tokenFile.exists(), isTrue);
+    final token = (await tokenFile.readAsString()).trim();
+    expect(token.length, 64);
+  });
 }
