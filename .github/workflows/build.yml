@@ -56,6 +56,11 @@ jobs:
         run: python3 scripts/fetch-xray.py --windows
       - name: Build velumd.exe
         run: cd daemon && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../bin/velumd.exe .
+      - name: Stage Windows docs and licenses
+        run: |
+          cp "$(go env GOMODCACHE)/github.com/sagernet/sing-box@v1.12.12/LICENSE" bin/LICENSE.sing-box
+          cp packaging/windows/README-WINDOWS.txt bin/README-WINDOWS.txt
+          cp NOTICE bin/NOTICE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: velumd-windows
@@ -63,6 +68,10 @@ jobs:
             bin/velumd.exe
             bin/sing-box.exe
             bin/xray.exe
+            bin/LICENSE.sing-box
+            bin/LICENSE.xray.exe
+            bin/README-WINDOWS.txt
+            bin/NOTICE.txt
 
   # ─── Flutter Linux (матрица дистрибутивов) ──────────────────────────────────
   flutter-linux:
@@ -173,6 +182,9 @@ jobs:
       - name: Flutter pub get
         working-directory: app
         run: flutter pub get
+      - name: Flutter analyze & test
+        working-directory: app
+        run: flutter analyze && flutter test
       - name: Flutter build windows
         working-directory: app
         run: flutter build windows --release
@@ -181,6 +193,13 @@ jobs:
         with:
           name: velumd-windows
           path: app/build/windows/x64/runner/Release/bin/
+      - name: Stage bundle docs
+        shell: pwsh
+        run: |
+          $src = "app/build/windows/x64/runner/Release"
+          Move-Item "$src/bin/README-WINDOWS.txt" "$src/README-WINDOWS.txt" -Force
+          Copy-Item "LICENSE" "$src/LICENSE" -Force
+          Copy-Item "NOTICE" "$src/NOTICE" -Force
       - name: Package
         shell: pwsh
         run: |
