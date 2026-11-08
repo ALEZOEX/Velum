@@ -134,3 +134,48 @@ func TestTunInboundConfigValidation(t *testing.T) {
 	}
 }
 
+func TestWindowsTunConfigKeepsStrictRouteAndExcludesServer(t *testing.T) {
+	cfg, err := buildConfigForOS(map[string]any{"type": "vless", "tag": "proxy", "server": "192.0.2.1", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000001"}, true, "", ConnectionSettings{}, "windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbounds, ok := cfg["inbounds"].([]any)
+	if !ok || len(inbounds) < 2 {
+		t.Fatal("expected mixed and tun inbounds")
+	}
+	tunInbound, ok := inbounds[1].(map[string]any)
+	if !ok {
+		t.Fatal("invalid tun inbound")
+	}
+	if tunInbound["interface_name"] != "Velum" || tunInbound["strict_route"] != true {
+		t.Fatalf("unexpected Windows tun inbound: %#v", tunInbound)
+	}
+	if err = excludeTunServer(cfg, "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	excluded, ok := tunInbound["route_exclude_address"].([]string)
+	if !ok || len(excluded) != 1 || excluded[0] != "192.0.2.1/32" {
+		t.Fatalf("server address was not excluded from TUN: %#v", tunInbound["route_exclude_address"])
+	}
+	if err = excludeTunServer(cfg, "not-an-ip"); err != nil {
+		t.Fatal(err)
+	}
+	excluded, _ = tunInbound["route_exclude_address"].([]string)
+	if len(excluded) != 1 {
+		t.Fatal("non-IP endpoint must not create a route exclusion")
+	}
+	if primaryServer(cfg) != "192.0.2.1" {
+		t.Fatal("primary server was not read from the config")
+	}
+	checkCoreConfig(t, cfg)
+}
+
+func TestCompanionServerExtraction(t *testing.T) {
+	companion := map[string]any{"outbounds": []any{map[string]any{"protocol": "vless", "settings": map[string]any{"vnext": []any{map[string]any{"address": "198.51.100.7", "port": 443}}}}}}
+	if got := companionServer(companion); got != "198.51.100.7" {
+		t.Fatalf("unexpected companion address: %q", got)
+	}
+	if got := companionServer(nil); got != "" {
+		t.Fatalf("nil companion must return an empty address, got %q", got)
+	}
+}

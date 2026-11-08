@@ -228,7 +228,7 @@ func stopProcess(cmd *exec.Cmd, done chan struct{}) {
 		return
 	default:
 	}
-	_ = cmd.Process.Signal(os.Interrupt)
+	interruptProcess(cmd)
 	select {
 	case <-done:
 	case <-time.After(4 * time.Second):
@@ -240,8 +240,15 @@ func startCompanion(executable, path, address string, logs *logBuffer) (*exec.Cm
 	cmd := exec.Command(executable, "run", "-config", path)
 	cmd.Stdout = logs
 	cmd.Stderr = logs
+	configureChild(cmd)
 	if e := cmd.Start(); e != nil {
 		return nil, nil, errors.New("Не удалось запустить Xray")
+	}
+	if e := afterStart(cmd); e != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		logs.add("error", e.Error())
+		return nil, nil, errors.New("Не удалось привязать Xray к задаче службы")
 	}
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()

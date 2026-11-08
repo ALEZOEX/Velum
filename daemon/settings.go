@@ -155,6 +155,10 @@ func buildConfig(raw string, tun bool, interfaceName string, s ConnectionSetting
 }
 
 func buildConfigWithOutbound(out map[string]any, tun bool, interfaceName string, s ConnectionSettings) (map[string]any, error) {
+	return buildConfigForOS(out, tun, interfaceName, s, runtime.GOOS)
+}
+
+func buildConfigForOS(out map[string]any, tun bool, interfaceName string, s ConnectionSettings, goos string) (map[string]any, error) {
 	if s.MTU == 0 {
 		s.MTU = 1400
 	}
@@ -181,9 +185,12 @@ func buildConfigWithOutbound(out map[string]any, tun bool, interfaceName string,
 		tunName := "velum0"
 		strictRoute := true
 		mtu := s.MTU
-		if runtime.GOOS == "windows" {
+		if goos == "windows" {
 			tunName = "Velum"
-			strictRoute = false
+			// Windows supports strict_route: it marks unsupported networks
+			// unreachable and prevents multi-homed DNS leaks. Keep it enabled;
+			// auto_route plus route.auto_detect_interface prevents loops.
+			strictRoute = true
 			if s.MTU == 0 || s.MTU == 1400 {
 				mtu = 1500
 			}
@@ -230,4 +237,74 @@ func buildConfigWithOutbound(out map[string]any, tun bool, interfaceName string,
 		return nil, err
 	}
 	return map[string]any{"log": map[string]any{"level": "info", "timestamp": true}, "inbounds": inbounds, "outbounds": []any{out, map[string]any{"type": "direct", "tag": "direct"}}, "dns": map[string]any{"servers": []any{remote, direct}, "final": "remote", "rules": dnsRules}, "route": route}, nil
+}
+
+// primaryServer returns the remote address of the first sing-box outbound.
+func primaryServer(cfg map[string]any) string {
+	outbounds, ok := cfg["outbounds"].([]any)
+	if !ok || len(outbounds) == 0 {
+		return ""
+	}
+	first, ok := outbounds[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	server, _ := first["server"].(string)
+	return server
+}
+
+// companionServer returns the VLESS address of the Xray companion outbound.
+func companionServer(cfg map[string]any) string {
+	if cfg == nil {
+		return ""
+	}
+	outbounds, ok := cfg["outbounds"].([]any)
+	if !ok || len(outbounds) == 0 {
+		return ""
+	}
+	first, ok := outbounds[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	settings, ok := first["settings"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	vnext, ok := settings["vnext"].([]any)
+	if !ok || len(vnext) == 0 {
+		return ""
+	}
+	node, ok := vnext[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	address, _ := node["address"].(string)
+	return address
+}
+
+// excludeTunServer keeps the VPN endpoint outside the tunnel so neither
+// sing-box nor the Xray companion can route its own transport back into TUN.
+func excludeTunServer(cfg map[string]any, server string) error {
+	ip := net.ParseIP(server)
+	if ip == nil {
+		return nil
+	}
+	inbounds, ok := cfg["inbounds"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, raw := range inbounds {
+		inbound, ok := raw.(map[string]any)
+		if !ok || inbound["type"] != "tun" {
+			continue
+		}
+		prefix := "/32"
+		if ip.To4() == nil {
+			prefix = "/128"
+		}
+		existing, _ := inbound["route_exclude_address"].([]string)
+		inbound["route_exclude_address"] = append(existing, ip.String()+prefix)
+		return nil
+	}
+	return nil
 }

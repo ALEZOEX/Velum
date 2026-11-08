@@ -41,6 +41,7 @@ type service struct {
 	done                                                 chan struct{}
 	state, lastError, core, interfaceName, dir, token    string
 	tun                                                  bool
+	tunActive                                            bool
 	proxyPort                                            int
 	connectedAt                                          time.Time
 	verified                                             bool
@@ -50,6 +51,7 @@ type service struct {
 	reconnectAt                                          time.Time
 	reconnectAttempts                                    int
 	apiAddress, apiSecret                                string
+	serviceMode, activeInterface                         string
 	uploadTotal, downloadTotal, uploadRate, downloadRate *int64
 	sampleAt                                             time.Time
 	logs                                                 logBuffer
@@ -60,7 +62,7 @@ func (s *service) stopCore() {
 		select {
 		case <-s.done:
 		default:
-			_ = s.cmd.Process.Signal(os.Interrupt)
+			interruptProcess(s.cmd)
 			select {
 			case <-s.done:
 			case <-time.After(4 * time.Second):
@@ -82,6 +84,7 @@ func (s *service) stopCore() {
 	s.connectedAt = time.Time{}
 	s.apiAddress = ""
 	s.apiSecret = ""
+	s.activeInterface = ""
 }
 func (s *service) stop() {
 	s.desired = nil
@@ -104,6 +107,10 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	var cfg, companionConfig map[string]any
 	var err error
 	var bridgeAddress string
+	activeInterface := s.interfaceName
+	if req.Settings.Interface != "" {
+		activeInterface = req.Settings.Interface
+	}
 	if isXHTTP(req.URI) {
 		if s.xray == "" {
 			return errors.New("Для XHTTP необходимо установить Xray и запустить службу с --xray /полный/путь/xray")
@@ -111,10 +118,7 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		if req.Settings.Fragment {
 			return errors.New("Для XHTTP отключите TLS-фрагментацию: она пока доступна только в sing-box")
 		}
-		iface := s.interfaceName
-		if req.Settings.Interface != "" {
-			iface = req.Settings.Interface
-		}
+		iface := activeInterface
 		if tun && iface == "" {
 			u, _ := url.Parse(req.URI)
 			targetHost := ""
@@ -140,6 +144,7 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		if err != nil {
 			return err
 		}
+		activeInterface = iface
 		bridge, e := bridgeOutbound(bridgeAddress, password)
 		if e != nil {
 			return e
@@ -153,6 +158,15 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	}
 	if err = applyExclusions(cfg, req.Exclusions); err != nil {
 		return err
+	}
+	if tun {
+		remote := companionServer(companionConfig)
+		if remote == "" {
+			remote = primaryServer(cfg)
+		}
+		if err = excludeTunServer(cfg, remote); err != nil {
+			return err
+		}
 	}
 	address, err := freeAddress()
 	if err != nil {
@@ -215,8 +229,15 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	}
 	cmd.Stdout = &s.logs
 	cmd.Stderr = &s.logs
+	configureChild(cmd)
 	if err = cmd.Start(); err != nil {
 		return errors.New("Не удалось запустить sing-box")
+	}
+	if err = afterStart(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		s.logs.add("error", err.Error())
+		return errors.New("Не удалось привязать sing-box к задаче службы")
 	}
 	s.cmd = cmd
 	s.done = make(chan struct{})
@@ -237,6 +258,8 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		}
 		s.state = "running"
 		s.lastError = ""
+		s.tunActive = tun
+		s.activeInterface = activeInterface
 		s.connectedAt = time.Now().UTC()
 		s.apiAddress = address
 		s.apiSecret = secret
@@ -374,6 +397,20 @@ func (s *service) inspectProcess() {
 		s.reconnectAt = time.Now().Add(2 * time.Second)
 	}
 }
+func (s *service) inspectInterface() {
+	if s.state != "running" || s.activeInterface == "" {
+		return
+	}
+	if _, err := net.InterfaceByName(s.activeInterface); err == nil {
+		return
+	}
+	message := fmt.Sprintf("Исходящий интерфейс %s больше не доступен", s.activeInterface)
+	s.stopCore()
+	s.state = "error"
+	s.lastError = message
+	s.logs.add("error", message)
+	s.reconnectAt = time.Now().Add(2 * time.Second)
+}
 func (s *service) monitor(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -384,6 +421,7 @@ func (s *service) monitor(ctx context.Context) {
 		case <-ticker.C:
 			s.mu.Lock()
 			s.inspectProcess()
+			s.inspectInterface()
 			if s.cmd == nil && s.desired != nil && s.desired.Settings.Reconnect && !time.Now().Before(s.reconnectAt) && s.reconnectAttempts < 5 {
 				req := *s.desired
 				attempt := s.reconnectAttempts + 1
@@ -420,7 +458,14 @@ func (s *service) status() map[string]any {
 	if s.xrayCmd != nil {
 		engine = "sing-box+xray"
 	}
-	return map[string]any{"state": s.state, "error": s.lastError, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine}
+	engineState := "stopped"
+	switch s.state {
+	case "running":
+		engineState = "running"
+	case "error":
+		engineState = "error"
+	}
+	return map[string]any{"state": s.state, "error": s.lastError, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine, "engineState": engineState, "serviceMode": s.serviceMode}
 }
 func probe(uri string) map[string]any {
 	probeURI := uri
@@ -512,66 +557,171 @@ func (s *service) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewEncoder(w).Encode(s.status())
 }
+
+type daemonConfig struct {
+	core, xray, tokenFile, interfaceName string
+	tunAllowed                           bool
+	managedBy                            string
+}
+
+type daemonRuntime struct {
+	svc      *service
+	server   *http.Server
+	listener net.Listener
+	dir      string
+}
+
+func defaultTokenFile() string {
+	if value := os.Getenv("VELUM_TOKEN_FILE"); value != "" {
+		return value
+	}
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	if data := os.Getenv("ProgramData"); data != "" {
+		path := filepath.Join(data, "Velum", "token")
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	if home := os.Getenv("USERPROFILE"); home != "" {
+		return filepath.Join(home, ".config", "velum", "token")
+	}
+	return ""
+}
+
+func resolvePaths(cfg *daemonConfig) error {
+	if cfg.core == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		name := "sing-box"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		cfg.core = filepath.Join(filepath.Dir(executable), name)
+		if info, err := os.Stat(cfg.core); err != nil || !info.Mode().IsRegular() {
+			if located, err := exec.LookPath(name); err == nil {
+				cfg.core = located
+			}
+		}
+	}
+	if cfg.xray == "" {
+		name := "xray"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		candidate := filepath.Join(filepath.Dir(cfg.core), name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			cfg.xray = candidate
+		}
+	}
+	if cfg.tokenFile == "" {
+		cfg.tokenFile = defaultTokenFile()
+	}
+	return nil
+}
+
+func prepareDaemon(cfg daemonConfig) (*daemonRuntime, error) {
+	if err := resolvePaths(&cfg); err != nil {
+		return nil, err
+	}
+	if cfg.tokenFile == "" {
+		return nil, errors.New("token file is required")
+	}
+	if err := validateXrayExecutable(cfg.xray); err != nil {
+		return nil, err
+	}
+	if err := (ConnectionSettings{Interface: cfg.interfaceName}).validate(cfg.tunAllowed); err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(cfg.core) {
+		return nil, errors.New("core path must be absolute")
+	}
+	info, err := os.Stat(cfg.core)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("sing-box executable not found")
+	}
+	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	version, verr := exec.CommandContext(vctx, cfg.core, "version").Output()
+	vcancel()
+	if verr != nil || !strings.Contains(string(version), "sing-box version 1.12.12\n") {
+		return nil, errors.New("requires sing-box 1.12.12; rebuild using make core")
+	}
+	ti, err := os.Stat(cfg.tokenFile)
+	if err != nil || !ti.Mode().IsRegular() || ti.Size() > 256 || (runtime.GOOS != "windows" && ti.Mode().Perm()&0077 != 0) {
+		return nil, errors.New("token file must be a private regular file (0600)")
+	}
+	b, err := os.ReadFile(cfg.tokenFile)
+	if err != nil {
+		return nil, err
+	}
+	token := strings.TrimSpace(string(b))
+	if len(token) < 32 {
+		return nil, errors.New("token must contain at least 32 characters")
+	}
+	dir, err := os.MkdirTemp("", "velum-core-")
+	if err != nil {
+		return nil, err
+	}
+	managedBy := cfg.managedBy
+	if managedBy == "" {
+		managedBy = "console"
+	}
+	s := &service{xray: cfg.xray, core: cfg.core, interfaceName: cfg.interfaceName, tun: cfg.tunAllowed, dir: dir, token: token, state: "disconnected", serviceMode: managedBy}
+	listener, err := net.Listen("tcp4", "127.0.0.1:27841")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	server := &http.Server{Handler: http.HandlerFunc(s.handler), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096}
+	return &daemonRuntime{svc: s, server: server, listener: listener, dir: dir}, nil
+}
+
+func (d *daemonRuntime) serve(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go d.svc.monitor(ctx)
+	go func() { <-ctx.Done(); _ = d.server.Close() }()
+	err := d.server.Serve(d.listener)
+	cancel()
+	d.svc.mu.Lock()
+	tunWasActive := d.svc.tunActive
+	d.svc.stop()
+	d.svc.mu.Unlock()
+	cleanupNetworkState(tunWasActive)
+	_ = os.RemoveAll(d.dir)
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
 func main() {
-	core := flag.String("core", "/usr/bin/sing-box", "Absolute path to trusted sing-box 1.12.12")
+	core := flag.String("core", "", "Absolute path to trusted sing-box 1.12.12 (default: beside the executable)")
 	tokenFile := flag.String("token-file", "", "Existing private token file")
 	tun := flag.Bool("tun", false, "Allow TUN (requires network privileges)")
 	interfaceName := flag.String("interface", "", "Bind outbound sockets to this existing interface")
 	xray := flag.String("xray", "", "Absolute path to trusted optional Xray executable for XHTTP")
+	serviceAction := flag.String("service", "", "Windows service action: install, uninstall or run")
+	serviceAccount := flag.String("service-account", "", "Optional Windows service account (default: LocalSystem)")
 	flag.Parse()
-	if err := validateXrayExecutable(*xray); err != nil {
-		log.Fatal(err)
+	cfg := daemonConfig{core: *core, xray: *xray, tokenFile: *tokenFile, interfaceName: *interfaceName, tunAllowed: *tun}
+	if *serviceAction != "" {
+		if err := runServiceAction(*serviceAction, cfg, *serviceAccount); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
-	if err := (ConnectionSettings{Interface: *interfaceName}).validate(*tun); err != nil {
-		log.Fatal(err)
-	}
-	if !filepath.IsAbs(*core) {
-		log.Fatal("core path must be absolute")
-	}
-	info, err := os.Stat(*core)
-	if err != nil || !info.Mode().IsRegular() {
-		log.Fatal("sing-box executable not found")
-	}
-	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	version, verr := exec.CommandContext(vctx, *core, "version").Output()
-	vcancel()
-	if verr != nil || !strings.Contains(string(version), "sing-box version 1.12.12\n") {
-		log.Fatal("requires sing-box 1.12.12; rebuild using make core")
-	}
-	ti, err := os.Stat(*tokenFile)
-	if err != nil || !ti.Mode().IsRegular() || ti.Size() > 256 || (runtime.GOOS != "windows" && ti.Mode().Perm()&0077 != 0) {
-		log.Fatal("token file must be a private regular file (0600)")
-	}
-	b, err := os.ReadFile(*tokenFile)
+	runtime, err := prepareDaemon(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	token := strings.TrimSpace(string(b))
-	if len(token) < 32 {
-		log.Fatal("token must contain at least 32 characters")
-	}
-	dir, err := os.MkdirTemp("", "velum-core-")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	s := &service{xray: *xray, core: *core, interfaceName: *interfaceName, tun: *tun, dir: dir, token: token, state: "disconnected"}
-	listener, err := net.Listen("tcp4", "127.0.0.1:27841")
-	if err != nil {
-		log.Fatal(err)
-	}
-	server := &http.Server{Handler: http.HandlerFunc(s.handler), ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 4096}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	go s.monitor(ctx)
-	go func() { <-ctx.Done(); _ = server.Close() }()
 	fmt.Println("Velum API: 127.0.0.1:27841")
-	err = server.Serve(listener)
-	cancel()
-	s.mu.Lock()
-	s.stop()
-	s.mu.Unlock()
-	if err != nil && err != http.ErrServerClosed {
+	if err := runtime.serve(ctx); err != nil {
 		log.Print(err)
 	}
 }
