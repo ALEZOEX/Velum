@@ -12,6 +12,7 @@ import 'client.dart';
 /// Abstract interface for Tray Manager operations to enable deterministic unit testing.
 abstract class TrayManagerAdapter {
   bool get isSupported;
+  Future<bool> isAvailable();
   Future<void> destroy();
   Future<void> setIcon(String iconPath);
   Future<void> setToolTip(String toolTip);
@@ -31,6 +32,67 @@ class RealTrayManagerAdapter implements TrayManagerAdapter {
     } catch (_) {
       return false;
     }
+  }
+
+  @override
+  Future<bool> isAvailable() async {
+    if (!isSupported) return false;
+    if (Platform.isLinux) {
+      for (final service in [
+        'org.kde.StatusNotifierWatcher',
+        'com.canonical.StatusNotifierWatcher',
+      ]) {
+        try {
+          final result = await Process.run('gdbus', [
+            'call',
+            '--session',
+            '--timeout',
+            '1',
+            '--dest',
+            service,
+            '--object-path',
+            '/StatusNotifierWatcher',
+            '--method',
+            'org.freedesktop.DBus.Properties.Get',
+            service,
+            'IsStatusNotifierHostRegistered',
+          ]);
+          if (result.exitCode != 0 ||
+              !RegExp(r'\btrue\b').hasMatch(result.stdout.toString())) {
+            continue;
+          }
+          final registered = await Process.run('gdbus', [
+            'call',
+            '--session',
+            '--timeout',
+            '1',
+            '--dest',
+            service,
+            '--object-path',
+            '/StatusNotifierWatcher',
+            '--method',
+            'org.freedesktop.DBus.Properties.Get',
+            service,
+            'RegisteredStatusNotifierItems',
+          ]);
+          if (registered.exitCode == 0 &&
+              registered.stdout.toString().contains(
+                'org.kde.StatusNotifierItem-$pid-',
+              )) {
+            return true;
+          }
+        } catch (_) {}
+      }
+      return false;
+    }
+    if (Platform.isWindows) {
+      try {
+        return tm.TrayManager.instance.trayIcon?.isVisible() ?? false;
+      } catch (_) {
+        return false;
+      }
+    }
+    return false;
   }
 
   @override
@@ -63,7 +125,7 @@ abstract class WindowActionAdapter {
   Future<void> hide();
   Future<void> close();
   Future<bool> isVisible();
-  Future<void> setHideOnClose(bool enable);
+  void setCloseRequestHandler(Future<void> Function()? handler);
 }
 
 /// Platform channel adapter using the "velum/window" channel.
@@ -72,44 +134,41 @@ class MethodChannelWindowAdapter implements WindowActionAdapter {
   static const _channel = MethodChannel('velum/window');
 
   @override
-  Future<void> show() async {
-    try {
-      await _channel.invokeMethod<void>('show');
-    } catch (_) {}
-  }
-
+  Future<void> show() => _channel.invokeMethod<void>('show');
   @override
-  Future<void> hide() async {
-    try {
-      await _channel.invokeMethod<void>('hide');
-    } catch (_) {}
-  }
-
+  Future<void> hide() => _channel.invokeMethod<void>('hide');
   @override
   Future<void> close() async {
     try {
-      await _channel.invokeMethod<void>('close');
-    } on MissingPluginException {
-      await SystemNavigator.pop();
-    } catch (_) {}
-  }
-
-  @override
-  Future<bool> isVisible() async {
-    try {
-      final res = await _channel.invokeMethod<bool>('isVisible');
-      return res ?? true;
-    } catch (_) {
-      return true;
+      await _channel.invokeMethod<void>('closeConfirmed');
+    } on PlatformException catch (error) {
+      if (error.code != 'window') rethrow; // Already destroyed is idempotent.
     }
   }
 
   @override
-  Future<void> setHideOnClose(bool enable) async {
-    try {
-      await _channel.invokeMethod<void>('setHideOnClose', enable);
-    } catch (_) {}
+  Future<bool> isVisible() async =>
+      await _channel.invokeMethod<bool>('isVisible') ?? false;
+  @override
+  void setCloseRequestHandler(Future<void> Function()? handler) {
+    _channel.setMethodCallHandler(
+      handler == null
+          ? null
+          : (call) async {
+              if (call.method != 'closeRequested') {
+                throw MissingPluginException();
+              }
+              await handler();
+            },
+    );
   }
+}
+
+enum ExitFailureAction { retry, cancel, force }
+
+abstract class ExitInteraction {
+  Future<bool> confirmProtectionLoss();
+  Future<ExitFailureAction> cleanupFailed(Object error);
 }
 
 /// Service managing the system tray icon, context menu, and application lifecycle.
@@ -118,15 +177,24 @@ class VelumTrayService with tm.TrayListener {
     required this.client,
     this.trayAdapter = const RealTrayManagerAdapter(),
     this.windowAdapter = const MethodChannelWindowAdapter(),
+    this.exitInteraction,
   });
 
   final VelumClient client;
   final TrayManagerAdapter trayAdapter;
   final WindowActionAdapter windowAdapter;
+  ExitInteraction? exitInteraction;
+  Future<void>? _closeRequest;
+  Future<void>? _trayDestruction;
+  Future<void> _trayWork = Future<void>.value();
+  bool _exitRequested = false;
+  bool _exiting = false;
+  bool _closed = false;
 
   bool _initialized = false;
   bool _disposed = false;
   bool _traySupported = false;
+  bool _trayRegistered = false;
 
   bool get isSupported => _traySupported;
 
@@ -139,42 +207,22 @@ class VelumTrayService with tm.TrayListener {
   /// Initializes the tray icon, listeners, and window close-interception settings.
   Future<void> initialize() async {
     if (_disposed || _initialized) return;
-
-    if (!Platform.isLinux && !Platform.isWindows && !Platform.isMacOS) {
-      _traySupported = false;
-      return;
-    }
-
+    _initialized = true;
+    windowAdapter.setCloseRequestHandler(handleWindowClose);
+    client.addListener(_onClientChanged);
     try {
       _traySupported = trayAdapter.isSupported;
     } catch (_) {
       _traySupported = false;
     }
-
-    if (!_traySupported) {
-      // In Wayland / Hyprland without compatible SNI or headless environments,
-      // window must not be minimized into a non-existent tray.
-      await windowAdapter.setHideOnClose(false);
-      return;
-    }
-
-    _initialized = true;
+    if (!_traySupported) return;
     trayAdapter.addListener(this);
-
-    // Sync window close behavior with user preference
-    final minimizeToTray = client.settings['minimizeToTray'] == true;
-    await windowAdapter.setHideOnClose(minimizeToTray);
-
-    client.addListener(_onClientChanged);
+    _trayRegistered = true;
     await updateTray(force: true);
   }
 
   void _onClientChanged() {
-    if (_disposed || !_initialized) return;
-
-    // Check if close behavior setting was updated in settings
-    final minimizeToTray = client.settings['minimizeToTray'] == true;
-    windowAdapter.setHideOnClose(minimizeToTray);
+    if (_disposed || !_initialized || _exiting || _closed) return;
 
     // Only update native tray menu/icon if functional state or connection status changed
     if (client.state != _cachedState ||
@@ -186,8 +234,14 @@ class VelumTrayService with tm.TrayListener {
   }
 
   /// Refreshes the tray icon and context menu.
-  Future<void> updateTray({bool force = false}) async {
-    if (!_traySupported || _disposed) return;
+  Future<void> updateTray({bool force = false}) {
+    if (_exiting || _closed || _disposed) return _trayWork;
+    _trayWork = _trayWork.then((_) => _updateTray(force: force));
+    return _trayWork;
+  }
+
+  Future<void> _updateTray({bool force = false}) async {
+    if (!_traySupported || _disposed || _exiting || _closed) return;
 
     final currentState = client.state;
     final currentProfile = client.activeProfile;
@@ -212,7 +266,11 @@ class VelumTrayService with tm.TrayListener {
     try {
       await trayAdapter.setIcon(iconPath);
       await trayAdapter.setToolTip('Velum — ${_statusLabel(currentState)}');
-    } catch (_) {}
+    } catch (_) {
+      _traySupported = false;
+      return;
+    }
+    if (_exiting || _closed || _disposed) return;
 
     // 2. Build Context Menu
     final menu = buildMenu();
@@ -270,10 +328,7 @@ class VelumTrayService with tm.TrayListener {
 
     return tm.Menu(
       items: [
-        tm.MenuItem(
-          key: 'open',
-          label: 'Открыть Velum',
-        ),
+        tm.MenuItem(key: 'open', label: 'Открыть Velum'),
         tm.MenuItem(
           key: 'toggle',
           label: toggleLabel,
@@ -291,10 +346,7 @@ class VelumTrayService with tm.TrayListener {
           disabled: true,
         ),
         tm.MenuItem.separator(),
-        tm.MenuItem(
-          key: 'exit',
-          label: 'Выход',
-        ),
+        tm.MenuItem(key: 'exit', label: 'Выход'),
       ],
     );
   }
@@ -335,45 +387,110 @@ class VelumTrayService with tm.TrayListener {
 
   /// Hides the main GUI window to the system tray.
   Future<void> hideWindow() async {
-    if (_traySupported) {
+    if (await _canHide()) {
       await windowAdapter.hide();
     } else {
       // If tray is unavailable, do not leave window unrecoverable; keep visible.
     }
   }
 
-  /// Intercepts window close action according to user preference and tray availability.
-  Future<void> handleWindowClose() async {
-    final minimizeToTray = client.settings['minimizeToTray'] == true;
-    if (_traySupported && minimizeToTray) {
-      await hideWindow();
-    } else {
-      await exitApplication();
+  Future<bool> _canHide() async {
+    if (!_initialized || !_traySupported || _trayDestruction != null) {
+      return false;
+    }
+    try {
+      return await trayAdapter.isAvailable();
+    } catch (_) {
+      return false;
     }
   }
 
-  /// Completely terminates the application and cleans up resources.
-  Future<void> exitApplication() async {
-    // Direct restoration here would race an apply already in flight.
-    await client.shutdown(disconnectConsole: true);
+  Future<void> handleWindowClose() => _requestClose(exit: false);
+  Future<void> exitApplication() => _requestClose(exit: true);
 
-    // 3. Destroy tray icon
-    try {
-      await trayAdapter.destroy();
-    } catch (_) {}
-
-    // 4. Close window and exit process
-    await windowAdapter.close();
-    exit(0);
+  Future<void> _requestClose({required bool exit}) {
+    if (_disposed || _closed) return Future<void>.value();
+    if (exit) _exitRequested = true;
+    return _closeRequest ??= _processClose().whenComplete(() {
+      _closeRequest = null;
+      _exitRequested = false;
+    });
   }
+
+  Future<void> _showBestEffort() async {
+    try {
+      await windowAdapter.show();
+    } catch (_) {}
+  }
+
+  Future<void> _processClose() async {
+    if (!_exitRequested &&
+        client.settings['minimizeToTray'] == true &&
+        await _canHide()) {
+      if (!_exitRequested && !_disposed) {
+        try {
+          await windowAdapter.hide();
+          if (!_exitRequested) return;
+        } catch (_) {
+          /* Continue with a visible, controlled exit. */
+        }
+      }
+    }
+    await _showBestEffort();
+    if (_disposed) return;
+    final interaction = exitInteraction;
+    // No ready UI delegate means no implicit consent to lose protection.
+    if (client.protectionMayBeActive &&
+        (interaction == null || !await interaction.confirmProtectionLoss())) {
+      return;
+    }
+    if (_disposed) return;
+    _exiting = true;
+    var retry = false;
+    var force = false;
+    while (!_disposed) {
+      try {
+        if (!force) await client.prepareForExit(retry: retry);
+        await client.finishExit(force: force);
+        try {
+          await _destroyTrayOnce();
+        } catch (_) {
+          if (!force) rethrow;
+        }
+        await windowAdapter.close();
+        _closed = true;
+        windowAdapter.setCloseRequestHandler(null);
+        return;
+      } catch (error) {
+        if (_disposed) return;
+        await _showBestEffort();
+        final decision = interaction == null
+            ? ExitFailureAction.cancel
+            : await interaction.cleanupFailed(error);
+        if (decision == ExitFailureAction.cancel) {
+          await client.cancelExit();
+          _exiting = false;
+          if (_trayDestruction != null) _traySupported = false;
+          await updateTray(force: true);
+          return;
+        }
+        force = decision == ExitFailureAction.force;
+        retry = decision == ExitFailureAction.retry;
+      }
+    }
+  }
+
+  Future<void> _destroyTrayOnce() => _trayDestruction ??= () async {
+    await _trayWork;
+    if (_trayRegistered) await trayAdapter.destroy();
+  }();
 
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    windowAdapter.setCloseRequestHandler(null);
     client.removeListener(_onClientChanged);
-    if (_traySupported) {
-      trayAdapter.removeListener(this);
-      unawaited(trayAdapter.destroy());
-    }
+    trayAdapter.removeListener(this);
+    unawaited(_destroyTrayOnce().catchError((Object _) {}));
   }
 }

@@ -19,18 +19,49 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
-static gboolean g_hide_on_close = FALSE;
+struct WindowCloseState {
+  GtkWindow* window;
+  FlMethodChannel* channel = nullptr;
+  bool allowed = false;
+  bool destroyed = false;
+};
 
-static gboolean window_delete_event(GtkWidget* widget, GdkEvent* event, gpointer user_data) {
-  if (g_hide_on_close) {
-    gtk_widget_hide(widget);
-    return TRUE; // Intercept close and keep running in background
+static gboolean window_delete_event(GtkWidget*, GdkEvent*, gpointer user_data) {
+  auto* state = static_cast<WindowCloseState*>(user_data);
+  if (state->allowed) return FALSE;
+  if (state->channel != nullptr && !state->destroyed) {
+    fl_method_channel_invoke_method(state->channel, "closeRequested", nullptr,
+                                   nullptr, nullptr, nullptr);
   }
-  return FALSE;
+  // A missing/not-yet-ready Dart handler must never imply consent to exit.
+  return TRUE;
+}
+
+static void window_destroyed(GtkWidget*, gpointer user_data) {
+  auto* state = static_cast<WindowCloseState*>(user_data);
+  state->destroyed = true;
+  state->window = nullptr;
+  if (state->channel != nullptr) {
+    fl_method_channel_set_method_call_handler(state->channel, nullptr, nullptr, nullptr);
+    g_clear_object(&state->channel);
+  }
+}
+
+static gboolean finish_window_close(gpointer user_data) {
+  auto* window = GTK_WIDGET(user_data);
+  auto* state = static_cast<WindowCloseState*>(
+      g_object_get_data(G_OBJECT(window), "velum-close-state"));
+  if (state != nullptr && !state->destroyed) gtk_window_close(GTK_WINDOW(window));
+  return G_SOURCE_REMOVE;
 }
 
 static void window_method_call(FlMethodChannel* channel, FlMethodCall* call, gpointer user_data) {
-  GtkWindow* window = GTK_WINDOW(user_data);
+  auto* state = static_cast<WindowCloseState*>(user_data);
+  GtkWindow* window = state->window;
+  if (state->destroyed || window == nullptr) {
+    fl_method_call_respond_error(call, "window", "window is not available", nullptr, nullptr);
+    return;
+  }
   const gchar* method = fl_method_call_get_name(call);
   if (g_strcmp0(method, "minimize") == 0) {
     gtk_window_iconify(window);
@@ -38,11 +69,16 @@ static void window_method_call(FlMethodChannel* channel, FlMethodCall* call, gpo
     if (gtk_window_is_maximized(window)) gtk_window_unmaximize(window);
     else gtk_window_maximize(window);
   } else if (g_strcmp0(method, "close") == 0) {
-    if (g_hide_on_close) {
-      gtk_widget_hide(GTK_WIDGET(window));
-    } else {
-      gtk_window_close(window);
+    gtk_window_close(window); // Always routes through delete-event -> Dart.
+  } else if (g_strcmp0(method, "closeConfirmed") == 0) {
+    fl_method_call_respond_success(call, nullptr, nullptr);
+    if (!state->allowed) {
+      state->allowed = true;
+      // Reply before destroying the engine that carries the method response.
+      g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, finish_window_close,
+                     g_object_ref(window), g_object_unref);
     }
+    return;
   } else if (g_strcmp0(method, "hide") == 0) {
     gtk_widget_hide(GTK_WIDGET(window));
   } else if (g_strcmp0(method, "show") == 0) {
@@ -53,11 +89,6 @@ static void window_method_call(FlMethodChannel* channel, FlMethodCall* call, gpo
     g_autoptr(FlValue) result = fl_value_new_bool(visible);
     fl_method_call_respond_success(call, result, nullptr);
     return;
-  } else if (g_strcmp0(method, "setHideOnClose") == 0) {
-    FlValue* args = fl_method_call_get_args(call);
-    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
-      g_hide_on_close = fl_value_get_bool(args);
-    }
   } else if (g_strcmp0(method, "drag") == 0) {
     GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
     GdkDevice* pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(display));
@@ -84,7 +115,11 @@ static void my_application_activate(GApplication* application) {
   minimum.min_width = 440;
   minimum.min_height = 640;
   gtk_window_set_geometry_hints(window, nullptr, &minimum, GDK_HINT_MIN_SIZE);
-  g_signal_connect(window, "delete-event", G_CALLBACK(window_delete_event), nullptr);
+  auto* close_state = new WindowCloseState{window};
+  g_object_set_data_full(G_OBJECT(window), "velum-close-state", close_state,
+      [](gpointer data) { delete static_cast<WindowCloseState*>(data); });
+  g_signal_connect(window, "delete-event", G_CALLBACK(window_delete_event), close_state);
+  g_signal_connect(window, "destroy", G_CALLBACK(window_destroyed), close_state);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
@@ -109,8 +144,9 @@ static void my_application_activate(GApplication* application) {
   g_autoptr(FlMethodChannel) window_channel = fl_method_channel_new(
       fl_engine_get_binary_messenger(fl_view_get_engine(view)),
       "velum/window", FL_METHOD_CODEC(codec));
+  close_state->channel = FL_METHOD_CHANNEL(g_object_ref(window_channel));
   fl_method_channel_set_method_call_handler(window_channel, window_method_call,
-      g_object_ref(window), g_object_unref);
+      close_state, nullptr);
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 

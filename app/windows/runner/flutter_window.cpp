@@ -8,8 +8,6 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
-static bool g_hide_on_close = false;
-
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -39,38 +37,35 @@ bool FlutterWindow::OnCreate() {
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
                  result) {
-        const std::string* method = std::get_if<std::string>(&call.method());
+        const std::string& method = call.method_name();
         HWND window = GetHandle();
-        if (method == nullptr || window == nullptr) {
+        if (window == nullptr) {
           result->Error("window", "window is not available");
           return;
         }
-        if (*method == "minimize") {
+        if (method == "minimize") {
           ShowWindow(window, SW_MINIMIZE);
-        } else if (*method == "maximize") {
+        } else if (method == "maximize") {
           ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
-        } else if (*method == "close") {
-          if (g_hide_on_close) {
-            ShowWindow(window, SW_HIDE);
-          } else {
+        } else if (method == "close") {
+          PostMessage(window, WM_CLOSE, 0, 0);
+        } else if (method == "closeConfirmed") {
+          result->Success();
+          if (!close_authorized_) {
+            close_authorized_ = true;
             PostMessage(window, WM_CLOSE, 0, 0);
           }
-        } else if (*method == "hide") {
+          return;
+        } else if (method == "hide") {
           ShowWindow(window, SW_HIDE);
-        } else if (*method == "show") {
+        } else if (method == "show") {
           ShowWindow(window, SW_RESTORE);
           SetForegroundWindow(window);
-        } else if (*method == "isVisible") {
+        } else if (method == "isVisible") {
           bool visible = IsWindowVisible(window) != FALSE;
           result->Success(flutter::EncodableValue(visible));
           return;
-        } else if (*method == "setHideOnClose") {
-          if (call.arguments()) {
-            if (const auto* val = std::get_if<bool>(call.arguments())) {
-              g_hide_on_close = *val;
-            }
-          }
-        } else if (*method == "drag") {
+        } else if (method == "drag") {
           ReleaseCapture();
           SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
         } else {
@@ -109,6 +104,14 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Intercept before plugins/default window handling can destroy the HWND.
+  if (message == WM_CLOSE) {
+    if (!close_authorized_) {
+      if (window_channel_) window_channel_->InvokeMethod("closeRequested", nullptr);
+      return 0;
+    }
+    return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
@@ -117,11 +120,6 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     if (result) {
       return *result;
     }
-  }
-
-  if (message == WM_CLOSE && g_hide_on_close) {
-    ShowWindow(hwnd, SW_HIDE);
-    return 0;
   }
 
   switch (message) {

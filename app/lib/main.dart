@@ -17,6 +17,7 @@ import 'arena_logs.dart';
 import 'arena_inspector.dart';
 import 'arena_icons.dart';
 import 'tray_service.dart';
+import 'exit_dialogs.dart';
 
 void main() => runApp(const VelumApp());
 
@@ -35,6 +36,7 @@ class VelumApp extends StatefulWidget {
 }
 
 class _VelumAppState extends State<VelumApp> {
+  final navigatorKey = GlobalKey<NavigatorState>();
   late final VelumClient client = widget.client ?? VelumClient();
   late final VelumTrayService trayService =
       widget.trayService ?? VelumTrayService(client: client);
@@ -43,6 +45,7 @@ class _VelumAppState extends State<VelumApp> {
   void initState() {
     super.initState();
     client.addListener(update);
+    trayService.exitInteraction ??= ExitDialogs(navigatorKey, client);
     if (widget.initialize) {
       unawaited(client.initialize());
       unawaited(trayService.initialize());
@@ -68,6 +71,7 @@ class _VelumAppState extends State<VelumApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
+    navigatorKey: navigatorKey,
     title: 'Velum',
     scrollBehavior: const MaterialScrollBehavior().copyWith(scrollbars: false),
     debugShowCheckedModeBanner: false,
@@ -217,15 +221,13 @@ class _HomeState extends State<Home> {
   }
 
   Future<void> windowAction(String action) async {
-    if (action == 'close' && widget.trayService != null) {
-      await widget.trayService!.handleWindowClose();
+    if (action == 'close') {
+      await widget.trayService?.handleWindowClose();
       return;
     }
     try {
       await const MethodChannel('velum/window').invokeMethod<void>(action);
-    } on MissingPluginException {
-      if (action == 'close') await SystemNavigator.pop();
-    }
+    } on MissingPluginException { /* Keep the GUI alive when native controls are absent. */ }
   }
 
   void inspectServer(int index) {

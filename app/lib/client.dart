@@ -62,6 +62,12 @@ typedef DaemonRequest = Future<Map<String, dynamic>> Function(
 );
 typedef ProxyListenerProbe = Future<bool> Function(int port);
 
+class _ExitSnapshot {
+  _ExitSnapshot(this.vpnRequested, this.protectionExpected);
+  final bool? vpnRequested;
+  final bool protectionExpected;
+}
+
 class VelumClient extends ChangeNotifier {
   VelumClient({
     Directory? directory,
@@ -108,6 +114,8 @@ class VelumClient extends ChangeNotifier {
   bool _closing = false;
   Future<void>? _initialization;
   Future<void>? _shutdownFuture;
+  _ExitSnapshot? _exitSnapshot;
+  bool _exitDaemonFinished = false;
   Future<void> _proxyWork = Future<void>.value();
   Future<void> _connectionWork = Future<void>.value();
   final Set<HttpClient> _httpClients = {};
@@ -224,6 +232,16 @@ class VelumClient extends ChangeNotifier {
     if (_closing) return;
     await refresh();
     if (_closing) return;
+    _startTimers();
+    if (settings['autoConnect'] == true &&
+        state == 'disconnected' &&
+        profiles.isNotEmpty) {
+      await reconnect();
+    }
+    notifyListeners();
+  }
+
+  void _startTimers() {
     _timer?.cancel();
     _subscriptionTimer?.cancel();
     _timer = Timer.periodic(
@@ -236,12 +254,6 @@ class VelumClient extends ChangeNotifier {
         _autoUpdateWork = null;
       });
     });
-    if (settings['autoConnect'] == true &&
-        state == 'disconnected' &&
-        profiles.isNotEmpty) {
-      await reconnect();
-    }
-    notifyListeners();
   }
 
   List<Profile> filteredProfiles({
@@ -1131,7 +1143,7 @@ class VelumClient extends ChangeNotifier {
     String path, [
     Map<String, dynamic>? body,
   ]) async {
-    if (_closing && path != 'disconnect') {
+    if (_closing && path != 'disconnect' && path != 'status') {
       throw StateError('Velum client is closing');
     }
     final requestRevision = _daemonRevision;
@@ -1139,7 +1151,7 @@ class VelumClient extends ChangeNotifier {
     if (_token.isEmpty) {
       _token = (await _tokenFile.readAsString()).trim();
     }
-    if (_closing && path != 'disconnect') {
+    if (_closing && path != 'disconnect' && path != 'status') {
       throw StateError('Velum client is closing');
     }
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
@@ -1699,6 +1711,93 @@ class VelumClient extends ChangeNotifier {
     } finally {
       busy = false;
       notifyListeners();
+    }
+  }
+
+  bool get protectionMayBeActive =>
+      running ||
+      busy ||
+      _vpnRequested == true ||
+      state == 'connecting' ||
+      state == 'reconnecting' ||
+      systemProxyStatus == SystemProxyStatus.enabled;
+
+  /// Freeze work using the existing proxy queue; keep the daemon alive until
+  /// the user has resolved cleanup errors and explicitly committed to exit.
+  Future<void> prepareForExit({bool retry = false}) async {
+    _exitSnapshot ??= _ExitSnapshot(_vpnRequested, protectionMayBeActive);
+    await shutdown();
+    if (retry) await _queueProxy(retry: true);
+    await _verifyExitProxy();
+  }
+
+  Future<void> _verifyExitProxy() async {
+    if (_proxyError.isNotEmpty) throw FormatException(_proxyError);
+    if (proxyManager != null && await proxyManager!.backupFile.exists()) {
+      throw const FormatException(
+        'Восстановление системного прокси не подтверждено. Журнал сохранён.',
+      );
+    }
+  }
+
+  Future<void> cancelExit() async {
+    if (_disposed) return;
+    final snapshot = _exitSnapshot;
+    if (snapshot == null) return;
+    await _shutdownFuture;
+    _closing = false;
+    _shutdownFuture = null;
+    _vpnRequested = snapshot.vpnRequested;
+    _exitSnapshot = null;
+    _exitDaemonFinished = false;
+    _lastProxyAttempt = null;
+    if (_initialization != null) _startTimers();
+    await refresh();
+    if (snapshot.protectionExpected &&
+        (!running ||
+            (mode != 'tun' &&
+                settings['systemProxy'] == true &&
+                systemProxyStatus != SystemProxyStatus.enabled))) {
+      message = _proxyError.isNotEmpty ? _proxyError : 'Выход отменён. Защита соединения не подтверждена; проверьте подключение.';
+      notifyListeners();
+    }
+  }
+
+  Future<void> finishExit({bool force = false}) async {
+    if (!force) await _verifyExitProxy();
+    if (_exitDaemonFinished) return;
+    if (!(_exitSnapshot?.protectionExpected ?? false) || managedByService) {
+      _exitDaemonFinished = true;
+      return;
+    }
+    try {
+      final latest = await _request('status');
+      final owner = latest['serviceMode'];
+      if (owner == 'systemd' || owner == 'windows-service') {
+        _exitDaemonFinished = true;
+        return;
+      }
+      if (!['disconnected', 'error'].contains(latest['state'])) {
+        if (owner != 'console') {
+          throw const FormatException(
+            'Не удалось определить владельца сетевого демона.',
+          );
+        }
+        final stopped = await _request('disconnect', {});
+        if (!['disconnected', 'error'].contains(stopped['state'])) {
+          throw const FormatException(
+            'Локальный демон не подтвердил отключение.',
+          );
+        }
+      }
+      _exitDaemonFinished = true;
+    } catch (error) {
+      if (!force) {
+        throw FormatException(
+          'Не удалось завершить локальное соединение: $error',
+        );
+      }
+      _exitDaemonFinished = true;
     }
   }
 
