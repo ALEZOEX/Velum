@@ -714,6 +714,51 @@ class _HomeState extends State<Home> {
           ),
         ),
       ),
+      const SizedBox(height: 12),
+      surface(
+        Column(
+          children: [
+            statusRow(
+              'Служба',
+              client.state == 'offline'
+                  ? 'недоступна'
+                  : client.managedByService
+                  ? 'служба Windows'
+                  : 'локальный демон',
+              ok: client.state != 'offline',
+            ),
+            statusRow(
+              'Ядро VPN',
+              switch (client.engineState) {
+                'running' =>
+                  'запущено · ${client.status['engine'] ?? 'sing-box'}',
+                'error' => 'ошибка',
+                _ => 'остановлено',
+              },
+              ok: client.engineState == 'running',
+              error: client.engineState == 'error',
+            ),
+            statusRow(
+              'Режим',
+              running
+                  ? client.mode == 'tun'
+                        ? 'TUN · весь трафик'
+                        : 'локальный прокси'
+                  : client.settings['mode'] == 'tun'
+                  ? 'TUN · после подключения'
+                  : 'прокси · после подключения',
+            ),
+            statusRow(
+              'Сервер',
+              selectedProfile == null
+                  ? 'не выбран'
+                  : client.latencyMs != null
+                  ? '${selectedProfile!.name} · ${client.latencyMs} мс'
+                  : selectedProfile!.name,
+            ),
+          ],
+        ),
+      ),
       const SizedBox(height: 20),
       Wrap(
         spacing: 10,
@@ -804,6 +849,50 @@ class _HomeState extends State<Home> {
         ),
       ),
     ];
+  }
+
+  Widget statusRow(String label, String value, {bool? ok, bool error = false}) {
+    final colors = Theme.of(context).colorScheme;
+    final color = error
+        ? colors.error
+        : ok == true
+        ? colors.primary
+        : colors.onSurfaceVariant;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Icon(
+            error
+                ? Icons.error_outline
+                : ok == true
+                ? Icons.check_circle_outline
+                : Icons.radio_button_unchecked,
+            size: 16,
+            color: color,
+          ),
+          const SizedBox(width: 10),
+          Text(
+            label,
+            style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant),
+          ),
+          const Spacer(),
+          Flexible(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: color,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget metric(String label, String value) => Column(

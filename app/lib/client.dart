@@ -78,6 +78,24 @@ class VelumClient extends ChangeNotifier {
   String _storageError = '';
   Future<void> _writes = Future<void>.value();
   File get _file => File('${directory.path}/profiles.json');
+  File get _tokenFile {
+    final override = Platform.environment['VELUM_TOKEN_FILE'];
+    if (override != null && override.isNotEmpty) return File(override);
+    if (Platform.isWindows) {
+      final programData = Platform.environment['ProgramData'];
+      if (programData != null && programData.isNotEmpty) {
+        final shared = File('$programData\\Velum\\token');
+        if (shared.existsSync()) return shared;
+      }
+    }
+    return File('${directory.path}/token');
+  }
+
+  bool get running => state == 'running';
+  String get engineState =>
+      status['engineState'] as String? ?? (running ? 'running' : 'stopped');
+  String get serviceMode => status['serviceMode'] as String? ?? 'console';
+  bool get managedByService => serviceMode == 'windows-service';
   bool get verified => status['verified'] == true;
   bool get tunAllowed => state != 'offline' && status['tunAllowed'] == true;
   int? get latencyMs => status['latencyMs'] as int?;
@@ -126,7 +144,7 @@ class VelumClient extends ChangeNotifier {
       _storageError = message;
     }
     try {
-      _token = (await File('${directory.path}/token').readAsString()).trim();
+      _token = (await _tokenFile.readAsString()).trim();
     } catch (_) {
       if (message.isEmpty) {
         message = 'Служба ещё не настроена. Выполните scripts/init-client.py.';
@@ -1031,7 +1049,7 @@ class VelumClient extends ChangeNotifier {
     Map<String, dynamic>? body,
   ]) async {
     if (_token.isEmpty) {
-      _token = (await File('${directory.path}/token').readAsString()).trim();
+      _token = (await _tokenFile.readAsString()).trim();
     }
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
     try {
@@ -1145,6 +1163,59 @@ class VelumClient extends ChangeNotifier {
     } else {
       await reconnect();
     }
+  }
+
+  /// Installs and starts the privileged Windows service after a UAC prompt.
+  /// The GUI itself never asks for permanent administrator rights.
+  Future<void> installWindowsService() async {
+    if (!Platform.isWindows) {
+      throw const FormatException(
+        'Системная служба доступна только в Windows.',
+      );
+    }
+    final executable = File(
+      '${File(Platform.resolvedExecutable).parent.path}\\bin\\velumd.exe',
+    );
+    if (!await executable.exists()) {
+      throw const FormatException(
+        'Не найден bin\\velumd.exe рядом с приложением Velum.',
+      );
+    }
+    final script =
+        "\$ErrorActionPreference = 'Stop'\n"
+        "\$arguments = '--service install --tun'\n"
+        "\$process = Start-Process -FilePath '${executable.path.replaceAll("'", "''")}' "
+        "-ArgumentList \$arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden\n"
+        "exit \$process.ExitCode\n";
+    final encoded = base64Encode(_utf16le(script));
+    final result = await Process.run('powershell', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      encoded,
+    ]);
+    if (result.exitCode != 0) {
+      final detail = '${result.stderr}'.trim();
+      throw FormatException(
+        detail.isEmpty
+            ? 'Установка службы отменена или завершилась с ошибкой.'
+            : 'Установка службы не удалась: $detail',
+      );
+    }
+    _token = '';
+    await refresh();
+  }
+
+  List<int> _utf16le(String value) {
+    final bytes = <int>[];
+    for (final unit in value.codeUnits) {
+      bytes
+        ..add(unit & 0xff)
+        ..add((unit >> 8) & 0xff);
+    }
+    return bytes;
   }
 
   Future<void> _runCommand(Future<void> Function() action) async {

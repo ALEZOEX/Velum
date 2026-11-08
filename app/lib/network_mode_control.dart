@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -34,26 +36,61 @@ class NetworkModeControl extends StatelessWidget {
     }
   }
 
+  Future<void> _install(BuildContext context) async {
+    try {
+      await client.installWindowsService();
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Служба Velum установлена и запущена.')),
+      );
+    } on FormatException catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error.message)));
+    } catch (_) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Не удалось установить службу Velum.')),
+      );
+    }
+  }
+
   void _help(BuildContext context) {
+    final windows = Platform.isWindows;
     showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Системный туннель TUN'),
-        content: const Text(
-          'Для перенаправления трафика всей системы установите системную службу Velum с поддержкой TUN. В каталоге проекта выполните:\n\nsudo ./scripts/install-linux-service.sh\n\nПосле установки служба должна сообщить, что TUN доступен. Прокси-режим сам по себе не меняет маршруты системы.',
+        content: Text(
+          windows
+              ? 'Для перенаправления трафика всей системы Velum устанавливает службу Windows. '
+                    'Потребуется подтверждение UAC. Служба запускает sing-box и TUN, '
+                    'а интерфейс продолжает работать без постоянных прав администратора.\n\n'
+                    'Если служба уже установлена, проверьте, что она запущена и собрана с поддержкой TUN. '
+                    'Обновить или удалить её можно командами:\n'
+                    'velumd.exe --service install --tun\n'
+                    'velumd.exe --service uninstall'
+              : 'Для перенаправления трафика всей системы установите системную службу Velum с поддержкой TUN. В каталоге проекта выполните:\n\nsudo ./scripts/install-linux-service.sh\n\nПосле установки служба должна сообщить, что TUN доступен. Прокси-режим сам по себе не меняет маршруты системы.',
         ),
         actions: [
-          TextButton(
-            onPressed: () async {
-              await Clipboard.setData(
-                const ClipboardData(
-                  text: 'sudo ./scripts/install-linux-service.sh',
-                ),
-              );
-              if (context.mounted) Navigator.pop(context);
-            },
-            child: const Text('Скопировать команду'),
-          ),
+          if (windows)
+            FilledButton(
+              onPressed: () => _install(context),
+              child: const Text('Установить службу'),
+            )
+          else
+            TextButton(
+              onPressed: () async {
+                await Clipboard.setData(
+                  const ClipboardData(
+                    text: 'sudo ./scripts/install-linux-service.sh',
+                  ),
+                );
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Скопировать команду'),
+            ),
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('Закрыть'),
