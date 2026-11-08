@@ -190,7 +190,9 @@ class VelumClient extends ChangeNotifier {
         isProxyInboundActive: inboundActive,
         userWantsProxy: userWantsProxy,
       );
-    } catch (_) {}
+    } catch (error) {
+      message = 'Не удалось восстановить системный прокси: $error';
+    }
     await refreshSystemProxyStatus();
     _timer?.cancel();
     _subscriptionTimer?.cancel();
@@ -1180,14 +1182,18 @@ class VelumClient extends ChangeNotifier {
       if (settings['systemProxy'] == true && mode != 'tun') {
         try {
           await proxyManager!.enable(host: '127.0.0.1', port: proxyPort);
-        } catch (_) {}
+        } catch (error) {
+          message = 'Не удалось включить системный прокси: $error';
+        }
         await refreshSystemProxyStatus();
       }
     } else if (from == 'running') {
       if (settings['systemProxy'] == true) {
         try {
           await proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
-        } catch (_) {}
+        } catch (error) {
+          message = 'Не удалось восстановить системный прокси: $error';
+        }
         await refreshSystemProxyStatus();
       }
     }
