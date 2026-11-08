@@ -56,21 +56,31 @@ enum LinuxServiceState {
   checkError,
 }
 
+typedef DaemonRequest = Future<Map<String, dynamic>> Function(
+  String path,
+  Map<String, dynamic>? body,
+);
+typedef ProxyListenerProbe = Future<bool> Function(int port);
+
 class VelumClient extends ChangeNotifier {
   VelumClient({
     Directory? directory,
     Uri? apiBase,
     this.proxyManager,
-  })  : directory =
-            directory ??
-            Directory(
-              Platform.environment['VELUM_CONFIG_DIR'] ??
-                  '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
-            ),
-        apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
+    this.daemonRequest,
+    this.proxyListenerProbe,
+  }) : directory =
+           directory ??
+           Directory(
+             Platform.environment['VELUM_CONFIG_DIR'] ??
+                 '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
+           ),
+       apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
 
   final Directory directory;
   final Uri apiBase;
+  final DaemonRequest? daemonRequest;
+  final ProxyListenerProbe? proxyListenerProbe;
   SystemProxyManager? proxyManager;
   SystemProxyStatus systemProxyStatus = SystemProxyStatus.disabled;
 
@@ -95,6 +105,33 @@ class VelumClient extends ChangeNotifier {
   Timer? _subscriptionTimer;
   bool _disposed = false;
   bool _polling = false;
+  bool _closing = false;
+  Future<void>? _initialization;
+  Future<void>? _shutdownFuture;
+  Future<void> _proxyWork = Future<void>.value();
+  Future<void> _connectionWork = Future<void>.value();
+  final Set<HttpClient> _httpClients = {};
+  final Set<Future<void>> _refreshTasks = {};
+  Future<void>? _autoUpdateWork;
+  int _proxyRevision = 0;
+  int _daemonRevision = 0;
+  int _connectionRevision = 0;
+  int _preferenceRevision = 0;
+  bool? _pendingProxyPreference;
+  bool? _vpnRequested;
+  bool _recoveryPending = true;
+  String? _lastProxyAttempt;
+  String _proxyError = '';
+
+  /// Completes once all already accepted proxy intents have been reconciled.
+  Future<void> get proxyIdle async {
+    while (true) {
+      final work = _proxyWork;
+      await work;
+      if (identical(work, _proxyWork)) return;
+    }
+  }
+
   String _token = '';
   String _storageError = '';
   Future<void> _writes = Future<void>.value();
@@ -140,7 +177,12 @@ class VelumClient extends ChangeNotifier {
     }
   }
 
-  Future<void> initialize() async {
+  Future<void> initialize() {
+    if (_closing || _disposed) return Future<void>.value();
+    return _initialization ??= _initialize();
+  }
+
+  Future<void> _initialize() async {
     try {
       await _prepareDirectory();
       if (await _file.exists()) {
@@ -166,6 +208,7 @@ class VelumClient extends ChangeNotifier {
           'Не удалось прочитать локальные профили. Проверьте каталог Velum.';
       _storageError = message;
     }
+    if (_closing) return;
     if (Platform.isLinux || Platform.isMacOS) {
       await _ensureClientToken();
     }
@@ -176,34 +219,23 @@ class VelumClient extends ChangeNotifier {
         message = 'Служба ещё не настроена. Выполните scripts/init-client.py.';
       }
     }
+    if (_closing) return;
     proxyManager ??= await createSystemProxyManager(configDirectory: directory);
+    if (_closing) return;
     await refresh();
-    try {
-      final proxyPort = settings['proxyPort'] as int? ?? 2080;
-      final isVpnRunning = (state == 'running');
-      final userWantsProxy = (settings['systemProxy'] == true);
-      final inboundActive = await isProxyInboundListening(proxyPort);
-      await proxyManager!.recoverIfOrphaned(
-        host: '127.0.0.1',
-        port: proxyPort,
-        isVpnRunning: isVpnRunning,
-        isProxyInboundActive: inboundActive,
-        userWantsProxy: userWantsProxy,
-      );
-    } catch (error) {
-      message = 'Не удалось восстановить системный прокси: $error';
-    }
-    await refreshSystemProxyStatus();
+    if (_closing) return;
     _timer?.cancel();
     _subscriptionTimer?.cancel();
     _timer = Timer.periodic(
       const Duration(seconds: 3),
       (_) => unawaited(refresh()),
     );
-    _subscriptionTimer = Timer.periodic(
-      const Duration(minutes: 1),
-      (_) => unawaited(_updateDueSubscriptions()),
-    );
+    _subscriptionTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (_closing || _autoUpdateWork != null) return;
+      _autoUpdateWork = _updateDueSubscriptions().whenComplete(() {
+        _autoUpdateWork = null;
+      });
+    });
     if (settings['autoConnect'] == true &&
         state == 'disconnected' &&
         profiles.isNotEmpty) {
@@ -269,6 +301,7 @@ class VelumClient extends ChangeNotifier {
             title: _cleanTitle(title ?? source.host),
           );
       final fetched = await _fetchSubscription(initial);
+      if (_closing) return;
       await _mutate(() {
         final index = subscriptions.indexWhere((s) => s.id == id);
         if (index < 0) {
@@ -310,8 +343,10 @@ class VelumClient extends ChangeNotifier {
         'Для подписки нужен HTTPS URL без встроенного пароля.',
       );
     }
+    if (_closing) throw StateError('Velum client is closing');
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 10);
+    _httpClients.add(client);
     try {
       final request = await client
           .getUrl(source)
@@ -385,6 +420,7 @@ class VelumClient extends ChangeNotifier {
         profiles: parsed,
       );
     } finally {
+      _httpClients.remove(client);
       client.close(force: true);
     }
   }
@@ -437,7 +473,7 @@ class VelumClient extends ChangeNotifier {
   }
 
   Future<void> updateSubscription(String id) async {
-    if (updatingSubscriptions.contains(id)) {
+    if (_closing || updatingSubscriptions.contains(id)) {
       return;
     }
     final initial = subscriptions.where((s) => s.id == id).firstOrNull;
@@ -457,6 +493,7 @@ class VelumClient extends ChangeNotifier {
         _replaceSubscriptionProfiles(id, fetched.profiles);
       });
     } catch (error) {
+      if (_closing) return;
       final text = error is FormatException
           ? error.message
           : 'Не удалось загрузить подписку. Сохранённые серверы оставлены.';
@@ -491,11 +528,12 @@ class VelumClient extends ChangeNotifier {
   }
 
   Future<void> _updateDueSubscriptions() async {
-    if (_disposed) {
+    if (_closing) {
       return;
     }
     final now = DateTime.now();
     for (final sub in List<Subscription>.of(subscriptions)) {
+      if (_closing) return;
       if (sub.autoUpdate &&
           (sub.lastUpdated == null ||
               now.difference(sub.lastUpdated!).inMinutes >=
@@ -637,7 +675,7 @@ class VelumClient extends ChangeNotifier {
   }
 
   Future<void> pingProfiles([List<int>? indices]) async {
-    if (pinging) {
+    if (_closing || pinging) {
       return;
     }
     final ids = (indices ?? List<int>.generate(profiles.length, (i) => i))
@@ -648,7 +686,7 @@ class VelumClient extends ChangeNotifier {
     notifyListeners();
     var cursor = 0;
     Future<void> worker() async {
-      while (cursor < ids.length && !_disposed) {
+      while (cursor < ids.length && !_closing) {
         final id = ids[cursor++];
         final profile = profiles.where((p) => p.id == id).firstOrNull;
         if (profile == null) {
@@ -668,6 +706,7 @@ class VelumClient extends ChangeNotifier {
             ms = result['latencyMs'] as int;
           }
         } catch (_) {
+          if (_closing) return;
           final watch = Stopwatch()..start();
           try {
             final socket = await Socket.connect(
@@ -681,6 +720,7 @@ class VelumClient extends ChangeNotifier {
             ms = null;
           }
         }
+        if (_closing) return;
         final index = profiles.indexWhere((p) => p.id == id);
         if (index >= 0) {
           profiles[index] = profiles[index].copyWith(
@@ -1091,10 +1131,19 @@ class VelumClient extends ChangeNotifier {
     String path, [
     Map<String, dynamic>? body,
   ]) async {
+    if (_closing && path != 'disconnect') {
+      throw StateError('Velum client is closing');
+    }
+    final requestRevision = _daemonRevision;
+    if (daemonRequest != null) return daemonRequest!(path, body);
     if (_token.isEmpty) {
       _token = (await _tokenFile.readAsString()).trim();
     }
+    if (_closing && path != 'disconnect') {
+      throw StateError('Velum client is closing');
+    }
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    _httpClients.add(client);
     try {
       final request = await client
           .openUrl(body == null ? 'GET' : 'POST', apiBase.resolve(path))
@@ -1122,7 +1171,7 @@ class VelumClient extends ChangeNotifier {
         throw const FormatException('Некорректный ответ службы.');
       }
       if (response.statusCode >= 400) {
-        if (data['state'] is String) {
+        if (data['state'] is String && requestRevision == _daemonRevision) {
           _apply(data);
         }
         throw FormatException(
@@ -1133,115 +1182,172 @@ class VelumClient extends ChangeNotifier {
       }
       return data;
     } finally {
+      _httpClients.remove(client);
       client.close(force: true);
     }
   }
 
-  Future<void> refresh() async {
-    if (_disposed || busy || _polling) {
-      return;
-    }
+  Future<void> refresh() {
+    if (_closing || busy || _polling) return Future<void>.value();
+    final work = _refresh();
+    _refreshTasks.add(work);
+    return work.whenComplete(() => _refreshTasks.remove(work));
+  }
+
+  Future<void> _refresh() async {
     _polling = true;
+    final revision = _daemonRevision;
     try {
-      _apply(await _request('status'));
-      if (proxyManager != null && proxyManager!.isSupported) {
-        final proxyPort = settings['proxyPort'] as int? ?? 2080;
-        final newStatus =
-            await proxyManager!.getStatus('127.0.0.1', proxyPort);
-        if (newStatus != systemProxyStatus) {
-          systemProxyStatus = newStatus;
-          notifyListeners();
-        }
-      }
+      final data = await _request('status');
+      if (!_closing && revision == _daemonRevision) _apply(data);
     } catch (_) {
-      state = 'offline';
+      if (!_closing && revision == _daemonRevision) _markOffline();
     } finally {
       _polling = false;
       notifyListeners();
     }
+    await proxyIdle;
   }
 
+  void _markOffline() => _apply({...status, 'state': 'offline'});
+
   void _apply(Map<String, dynamic> data) {
-    final previousState = state;
+    if (_closing) return;
+    _daemonRevision++;
     status = data;
     state = data['state'] as String? ?? 'offline';
     mode = data['mode'] as String? ?? '';
-    message = _storageError.isEmpty
-        ? data['error'] as String? ?? ''
-        : _storageError;
-
-    _handleStateTransition(previousState, state);
+    message = _storageError.isNotEmpty
+        ? _storageError
+        : _proxyError.isNotEmpty
+        ? _proxyError
+        : data['error'] as String? ?? '';
+    _queueProxy();
   }
 
-  Future<void> _handleStateTransition(String from, String to) async {
-    if (from == to || proxyManager == null || !proxyManager!.isSupported) {
-      return;
+  int get _localProxyPort {
+    final endpoint = Uri.tryParse('http://${status['proxy'] ?? ''}');
+    if (endpoint != null && endpoint.hasPort && endpoint.port > 0) {
+      return endpoint.port;
     }
-    final proxyPort = settings['proxyPort'] as int? ?? 2080;
-    if (to == 'running') {
-      if (settings['systemProxy'] == true && mode != 'tun') {
-        try {
-          await proxyManager!.enable(host: '127.0.0.1', port: proxyPort);
-        } catch (error) {
-          message = 'Не удалось включить системный прокси: $error';
-        }
-        await refreshSystemProxyStatus();
+    return settings['proxyPort'] as int? ?? 2080;
+  }
+
+  Future<void> _queueProxy({bool retry = false}) {
+    final revision = ++_proxyRevision;
+    if (retry) _lastProxyAttempt = null;
+    // Both reads of journal status and OS writes share this queue. Each item
+    // evaluates current intent, not the state captured by an old HTTP reply.
+    _proxyWork = _proxyWork.then((_) => _reconcileProxy(revision));
+    return _proxyWork;
+  }
+
+  Future<void> _reconcileProxy(int revision) async {
+    if (revision != _proxyRevision) return;
+    final manager = proxyManager;
+    if (manager == null) return;
+    try {
+      if (!manager.isSupported) {
+        systemProxyStatus = SystemProxyStatus.unsupported;
+        return;
       }
-    } else if (from == 'running') {
-      if (settings['systemProxy'] == true) {
-        try {
-          await proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
-        } catch (error) {
-          message = 'Не удалось восстановить системный прокси: $error';
+      final port = _localProxyPort;
+      final wants =
+          !_closing &&
+          _vpnRequested != false &&
+          (_pendingProxyPreference ?? settings['systemProxy'] == true) &&
+          mode != 'tun';
+      final uncertain =
+          state == 'offline' ||
+          state == 'connecting' ||
+          state == 'reconnecting';
+      // An explicit disable/shutdown needs no listener evidence. Only ambiguous
+      // daemon availability requires probing before changing an owned proxy.
+      final listening = wants && (state == 'running' || uncertain)
+          ? await isProxyInboundListening(port)
+          : false;
+      if (revision != _proxyRevision) return;
+      final intent = wants && listening && state == 'running'
+          ? 'enable'
+          : wants && listening && uncertain
+          ? 'preserve'
+          : 'restore';
+      final key = '$intent:$port:$state:$mode';
+      if (_lastProxyAttempt != key) {
+        _lastProxyAttempt = key;
+        if (_recoveryPending) {
+          _recoveryPending = false;
+          await manager.recoverIfOrphaned(
+            host: '127.0.0.1',
+            port: port,
+            isVpnRunning: listening && (state == 'running' || uncertain),
+            isProxyInboundActive: listening,
+            userWantsProxy: wants,
+          );
+          if (revision != _proxyRevision) {
+            // Recovery may have finished without applying the requested state.
+            if (_lastProxyAttempt == key) _lastProxyAttempt = null;
+            return;
+          }
         }
-        await refreshSystemProxyStatus();
+        if (intent == 'enable') {
+          await manager.enable(host: '127.0.0.1', port: port);
+        } else if (intent == 'restore') {
+          await manager.restore(host: '127.0.0.1', port: port);
+        }
+        if (revision != _proxyRevision) return;
+        if (intent != 'preserve') {
+          if (message == _proxyError) message = '';
+          _proxyError = '';
+        }
       }
+      final actual = await manager.getStatus('127.0.0.1', port);
+      if (revision != _proxyRevision) return;
+      systemProxyStatus = actual;
+    } catch (error) {
+      if (revision != _proxyRevision) return;
+      _proxyError = 'Не удалось согласовать системный прокси: $error';
+      message = _proxyError;
+      systemProxyStatus = error is SystemProxyConflictException
+          ? SystemProxyStatus.conflict
+          : SystemProxyStatus.error;
+    } finally {
+      if (revision == _proxyRevision) notifyListeners();
     }
   }
 
-  Future<void> refreshSystemProxyStatus() async {
-    if (proxyManager == null) return;
-    if (!proxyManager!.isSupported) {
-      systemProxyStatus = SystemProxyStatus.unsupported;
-      notifyListeners();
-      return;
-    }
-    final proxyPort = settings['proxyPort'] as int? ?? 2080;
-    systemProxyStatus = await proxyManager!.getStatus('127.0.0.1', proxyPort);
-    notifyListeners();
-  }
+  Future<void> refreshSystemProxyStatus() => _queueProxy();
 
   Future<void> setSystemProxyEnabled(bool enabled) async {
-    await saveSettings({'systemProxy': enabled});
-    if (proxyManager == null || !proxyManager!.isSupported) {
-      await refreshSystemProxyStatus();
-      return;
-    }
-    final proxyPort = settings['proxyPort'] as int? ?? 2080;
-    if (enabled) {
-      if (state == 'running' && mode != 'tun') {
-        try {
-          await proxyManager!.enable(host: '127.0.0.1', port: proxyPort);
-        } catch (e) {
-          message = 'Не удалось включить системный прокси: $e';
-        }
+    if (_closing) return;
+    final revision = ++_preferenceRevision;
+    _pendingProxyPreference = enabled;
+    try {
+      await saveSettings({'systemProxy': enabled});
+    } catch (_) {
+      if (revision == _preferenceRevision) {
+        _pendingProxyPreference = null;
+        await _queueProxy(retry: true);
       }
-    } else {
-      try {
-        await proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
-      } catch (e) {
-        message = 'Не удалось восстановить системный прокси: $e';
-      }
+      rethrow;
     }
-    await refreshSystemProxyStatus();
+    if (revision == _preferenceRevision) {
+      _pendingProxyPreference = null;
+      await _queueProxy(retry: true);
+    }
+    await proxyIdle;
   }
 
   /// Probes whether a local TCP listener is actively accepting connections on the proxy port.
   Future<bool> isProxyInboundListening([int? port]) async {
     final targetPort = port ?? (settings['proxyPort'] as int? ?? 2080);
+    if (proxyListenerProbe != null) return proxyListenerProbe!(targetPort);
     try {
-      final socket = await Socket.connect('127.0.0.1', targetPort,
-          timeout: const Duration(milliseconds: 300));
+      final socket = await Socket.connect(
+        '127.0.0.1',
+        targetPort,
+        timeout: const Duration(milliseconds: 300),
+      );
       socket.destroy();
       return true;
     } catch (_) {
@@ -1251,6 +1357,7 @@ class VelumClient extends ChangeNotifier {
 
   Future<void> refreshLogs() async {
     final result = await _request('logs');
+    if (_closing) return;
     final entries = result['entries'];
     if (entries is List) {
       logs
@@ -1268,13 +1375,32 @@ class VelumClient extends ChangeNotifier {
   Future<void> checkConnection() async => _runCommand(() async {
     _apply(await _request('check', {}));
   });
-  Future<void> reconnect() async {
-    if (profiles.isEmpty) {
-      return;
-    }
-    await _runCommand(() async {
-      _apply(await _request('connect', _connectBody()));
+  Future<void> reconnect() {
+    if (_closing || profiles.isEmpty) return Future<void>.value();
+    return _connectionCommand(true);
+  }
+
+  Future<void> disconnect() {
+    if (_closing) return Future<void>.value();
+    return _connectionCommand(false);
+  }
+
+  Future<void> _connectionCommand(bool connect) {
+    final revision = ++_connectionRevision;
+    _daemonRevision++;
+    _vpnRequested = connect;
+    _queueProxy(retry: true);
+    _connectionWork = _connectionWork.then((_) async {
+      if (_closing || revision != _connectionRevision) return;
+      await _runCommand(() async {
+        final data = await _request(
+          connect ? 'connect' : 'disconnect',
+          connect ? _connectBody() : {},
+        );
+        if (revision == _connectionRevision) _apply(data);
+      });
     });
+    return _connectionWork;
   }
 
   Map<String, dynamic> _connectBody() => {
@@ -1286,15 +1412,8 @@ class VelumClient extends ChangeNotifier {
         .toList(),
     'settings': {for (final key in _networkKeys) key: settings[key]},
   };
-  Future<void> toggle() async {
-    if (state == 'running') {
-      await _runCommand(() async {
-        _apply(await _request('disconnect', {}));
-      });
-    } else {
-      await reconnect();
-    }
-  }
+  Future<void> toggle() =>
+      (_vpnRequested ?? running) ? disconnect() : reconnect();
 
   /// Installs and starts the privileged Windows service after a UAC prompt.
   /// The GUI itself never asks for permanent administrator rights.
@@ -1352,8 +1471,9 @@ class VelumClient extends ChangeNotifier {
     }
     final random = Random.secure();
     final bytes = List<int>.generate(32, (_) => random.nextInt(256));
-    final tokenHex =
-        bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    final tokenHex = bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
     try {
       await _prepareDirectory();
       await _privateWrite(file, utf8.encode('$tokenHex\n'));
@@ -1561,7 +1681,7 @@ class VelumClient extends ChangeNotifier {
   }
 
   Future<void> _runCommand(Future<void> Function() action) async {
-    if (busy) {
+    if (_closing || busy) {
       return;
     }
     busy = true;
@@ -1570,25 +1690,58 @@ class VelumClient extends ChangeNotifier {
     try {
       await action();
     } on FormatException catch (error) {
-      message = error.message;
+      if (!_closing) message = error.message;
     } catch (_) {
-      state = 'offline';
-      message = 'Служба недоступна. Проверьте её запуск и токен.';
+      if (!_closing) {
+        _markOffline();
+        message = 'Служба недоступна. Проверьте её запуск и токен.';
+      }
     } finally {
       busy = false;
       notifyListeners();
     }
   }
 
-  @override
-  void dispose() {
-    _disposed = true;
+  /// Orderly GUI exit awaits pending writes and restores only owned settings.
+  Future<void> shutdown({bool disconnectConsole = false}) =>
+      _shutdownFuture ??= _shutdown(disconnectConsole);
+
+  Future<void> _shutdown(bool disconnectConsole) async {
+    _closing = true;
+    final stopConsole =
+        disconnectConsole &&
+        !managedByService &&
+        (running || _vpnRequested == true);
+    _vpnRequested = false;
+    _connectionRevision++;
+    _daemonRevision++;
     _timer?.cancel();
     _subscriptionTimer?.cancel();
-    if (state == 'running' && settings['systemProxy'] == true) {
-      final proxyPort = settings['proxyPort'] as int? ?? 2080;
-      proxyManager?.restore(host: '127.0.0.1', port: proxyPort).ignore();
+    for (final client in _httpClients.toList()) {
+      client.close(force: true);
     }
+    // Cleanup joins the same queue immediately, behind any in-flight apply.
+    _queueProxy(retry: true);
+    await _initialization;
+    await _connectionWork;
+    await Future.wait(_refreshTasks.toList());
+    await _autoUpdateWork;
+    if (stopConsole) {
+      try {
+        await _request('disconnect', {});
+      } catch (_) {}
+    }
+    // Initialization may have still been constructing the manager at exit.
+    await _queueProxy();
+    await proxyIdle;
+    await _writes;
+  }
+
+  @override
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    unawaited(shutdown());
     super.dispose();
   }
 }

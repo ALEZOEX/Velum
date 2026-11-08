@@ -738,9 +738,14 @@ void main() {
       configDirectory: directory,
       api: api,
     );
-    final client = VelumClient(directory: directory, proxyManager: manager)
-      ..state = 'running'
-      ..mode = 'proxy';
+    final client =
+        VelumClient(
+            directory: directory,
+            proxyManager: manager,
+            proxyListenerProbe: (_) async => true,
+          )
+          ..state = 'running'
+          ..mode = 'proxy';
     try {
       await client.setSystemProxyEnabled(true);
       api.failOption = 75;

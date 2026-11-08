@@ -354,20 +354,8 @@ class VelumTrayService with tm.TrayListener {
 
   /// Completely terminates the application and cleans up resources.
   Future<void> exitApplication() async {
-    // 1. Prevent leaving an orphaned system proxy pointing to dead local port
-    try {
-      if (client.proxyManager != null && client.proxyManager!.isSupported) {
-        final proxyPort = client.settings['proxyPort'] as int? ?? 2080;
-        await client.proxyManager!.restore(host: '127.0.0.1', port: proxyPort);
-      }
-    } catch (_) {}
-
-    // 2. If VPN is not managed by a permanent system service, disconnect
-    try {
-      if (!client.managedByService && client.state == 'running') {
-        await client.toggle();
-      }
-    } catch (_) {}
+    // Direct restoration here would race an apply already in flight.
+    await client.shutdown(disconnectConsole: true);
 
     // 3. Destroy tray icon
     try {
