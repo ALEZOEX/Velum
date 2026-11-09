@@ -167,7 +167,7 @@ func TestServiceFilesystemDisposableVM(t *testing.T) {
 	tree.close()
 	path := filepath.Join(dir, "bin", "velumd.exe")
 	ptr, _ := windows.UTF16PtrFromString(path)
-	h, err := windows.CreateFile(ptr, windows.WRITE_DAC, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	h, err := windows.CreateFile(ptr, windows.READ_CONTROL|windows.WRITE_DAC, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
