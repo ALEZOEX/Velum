@@ -22,7 +22,8 @@ $previous = $env:VELUM_F1_DISPOSABLE_VM
 try {
   $env:VELUM_F1_DISPOSABLE_VM = '1'
   # Native NTFS fixture tests only: no SCM installation, no VPN, no TUN.
-  & $binary -test.run '^TestService' -test.v -test.timeout=120s
+  $testArguments = @('-test.run=^TestService', '-test.v', '-test.timeout=120s')
+  & $binary @testArguments
   if ($LASTEXITCODE -ne 0) { throw "Security tests failed with exit code $LASTEXITCODE" }
 } finally {
   if ($null -eq $previous) { Remove-Item Env:VELUM_F1_DISPOSABLE_VM -ErrorAction SilentlyContinue }
