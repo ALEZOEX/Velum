@@ -74,6 +74,9 @@ func TestServiceNativeRenameLayout(t *testing.T) {
 	if unsafe.Offsetof(serviceRenameInfo{}.RootDirectory) != 8 || unsafe.Offsetof(serviceRenameInfo{}.FileNameLength) != 16 || unsafe.Offsetof(serviceRenameInfo{}.FileName) != 20 {
 		t.Fatal("incorrect FILE_RENAME_INFORMATION layout")
 	}
+	if unsafe.Offsetof(serviceDirectoryIDEntry{}.FileID) != 96 || unsafe.Offsetof(serviceDirectoryIDEntry{}.FileName) != 104 {
+		t.Fatal("incorrect FILE_ID_BOTH_DIR_INFO layout")
+	}
 }
 
 func TestServiceNativePathPolicy(t *testing.T) {

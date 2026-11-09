@@ -40,9 +40,18 @@ F12/F13 themselves are not evaluated or marked fixed here.
    sharing. Every opened component is inspected for actual type and reparse flag.
 3. Ancestors must be owned by SYSTEM, Administrators or TrustedInstaller. Their
    current-object ACEs must not grant nontrusted subjects DELETE_CHILD, DELETE,
-   WRITE_DAC, WRITE_OWNER, write attributes/EA, generic write or generic all.
+   WRITE_DAC, WRITE_OWNER, generic write or generic all.
    ProgramData may legitimately permit creating children; FILE_CREATE handles
    the race for Velum's name by failing if another object wins creation.
+   Standard ProgramData also grants Users write attributes/EA. This is accepted
+   only with a pinned nonempty-directory anchor: the next ancestor component,
+   or the existing Microsoft directory for the final ProgramData component.
+   The child handle denies share-delete, and its volume/file ID must match an
+   entry enumerated through the actual held parent handle. NTFS rejects setting
+   reparse points on nonempty directories. After installation the protected
+   Velum child (including the retained token/root after uninstall) prevents
+   ordinary users from emptying ProgramData. Missing/mismatched anchors cause
+   refusal; no ancestor ACL is changed to make a test pass.
 4. Existing service objects must already have a trusted SYSTEM/Administrators
    owner and the exact protected allow-only DACL. Explicit deny, inherited,
    unexpected and duplicate ACEs are refused. Files must have exactly one hard
@@ -91,6 +100,9 @@ compatibility cost of closing this boundary.
 
 - Native filesystem/SCM semantics still require actual Windows validation,
   including share-mode compatibility with the image loader and security software.
+- Attribute-writable ancestors require an existing anchor. Minimal/custom
+  installations without a usable Microsoft directory may be conservatively
+  refused rather than implicitly trusted or reconfigured.
 - Multi-file publication is not atomic. No service is registered on copy/ACL
   failures; complete protected binaries/token can remain. Interrupted cleanup
   may require inspection of an unknown stage.
@@ -201,3 +213,4 @@ Native API references:
 - [SetSecurityInfo replaces the supplied DACL](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo)
 - [GetSecurityInfo actual descriptor readback](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo)
 - [GetFileInformationByHandle identity/link metadata](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
+- [NTFS refuses reparse points on nonempty directories](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/fsctl-set-reparse-point)

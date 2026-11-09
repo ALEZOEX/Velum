@@ -242,8 +242,31 @@ func pinServicePath(path string, trusted bool) ([]windows.Handle, error) {
 			return nil, inspectErr
 		}
 		if trusted {
-			if err = validateServiceAncestor(s); err != nil {
-				return nil, fmt.Errorf("unsafe ancestor of %s: %w", path, err)
+			if err = validateServiceAncestor(s, false); err != nil {
+				// Standard ProgramData grants Users WRITE_ATTRIBUTES/WRITE_EA.
+				// Those rights cannot add a reparse point to a nonempty NTFS
+				// directory. Pin a real child entry, without share-delete, and
+				// verify its file ID by enumerating the held parent handle.
+				// No DELETE/DELETE_CHILD/ACL/owner grant is excused by this.
+				if strictErr := validateServiceAncestor(s, true); strictErr != nil {
+					return nil, fmt.Errorf("unsafe ancestor of %s: %w", path, strictErr)
+				}
+				childName := "Microsoft"
+				if i < len(parts) && parts[i] != "" {
+					childName = parts[i]
+				}
+				anchor, anchorErr := pinServiceAnchor(h, childName)
+				if anchorErr != nil {
+					return nil, fmt.Errorf("cannot safely anchor attribute-writable ancestor of %s: %w", path, anchorErr)
+				}
+				handles = append(handles, anchor)
+				s, inspectErr = inspectServiceHandle(h)
+				if inspectErr != nil {
+					return nil, inspectErr
+				}
+				if err = validateServiceAncestor(s, true); err != nil {
+					return nil, err
+				}
 			}
 		} else if s.reparse || !s.directory {
 			return nil, errors.New("source ancestor is a reparse point or not a directory")
@@ -257,8 +280,92 @@ func pinServicePath(path string, trusted bool) ([]windows.Handle, error) {
 		}
 		handles = append(handles, h)
 	}
+	// Callers use the last handle as the requested directory, not an anchor.
+	for i, held := range handles {
+		if held == h {
+			handles = append(handles[:i], handles[i+1:]...)
+			break
+		}
+	}
+	handles = append(handles, h)
 	success = true
 	return handles, nil
+}
+
+// FILE_ID_BOTH_DIR_INFO layout, with a flexible UTF-16 name starting at 104.
+type serviceDirectoryIDEntry struct {
+	NextEntryOffset, FileIndex                              uint32
+	CreationTime, LastAccessTime, LastWriteTime, ChangeTime int64
+	EndOfFile, AllocationSize                               int64
+	FileAttributes, FileNameLength, EaSize                  uint32
+	ShortNameLength                                         uint8
+	ShortName                                               [12]uint16
+	FileID                                                  int64
+	FileName                                                [1]uint16
+}
+
+func pinServiceAnchor(parent windows.Handle, name string) (windows.Handle, error) {
+	h, err := serviceOpenAt(parent, name, true, false, nil, 0)
+	if err != nil {
+		return 0, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = windows.CloseHandle(h)
+		}
+	}()
+	var childInfo, parentInfo windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(h, &childInfo); err != nil {
+		return 0, err
+	}
+	if childInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return 0, errors.New("anchor is a reparse point")
+	}
+	if err = windows.GetFileInformationByHandle(parent, &parentInfo); err != nil {
+		return 0, err
+	}
+	if childInfo.VolumeSerialNumber != parentInfo.VolumeSerialNumber {
+		return 0, errors.New("anchor is on another volume")
+	}
+	id := uint64(childInfo.FileIndexHigh)<<32 | uint64(childInfo.FileIndexLow)
+	buffer := make([]byte, 65536)
+	class := uint32(windows.FileIdBothDirectoryRestartInfo)
+	offset := int(unsafe.Offsetof(serviceDirectoryIDEntry{}.FileName))
+	for batch := 0; batch < 4096; batch++ {
+		err = windows.GetFileInformationByHandleEx(parent, class, &buffer[0], uint32(len(buffer)))
+		if err != nil {
+			return 0, fmt.Errorf("enumerate parent for anchor identity: %w", err)
+		}
+		class = windows.FileIdBothDirectoryInfo
+		for pos := 0; ; {
+			if pos+offset > len(buffer) {
+				return 0, errors.New("invalid directory entry header")
+			}
+			entry := (*serviceDirectoryIDEntry)(unsafe.Pointer(&buffer[pos]))
+			size := int(entry.FileNameLength)
+			if size%2 != 0 || size < 0 || size > len(buffer)-pos-offset {
+				return 0, errors.New("invalid directory entry name")
+			}
+			value := windows.UTF16ToString(unsafe.Slice(&entry.FileName[0], size/2))
+			if strings.EqualFold(value, name) {
+				if uint64(entry.FileID) != id {
+					return 0, errors.New("anchor identity does not match actual parent entry")
+				}
+				success = true
+				return h, nil
+			}
+			if entry.NextEntryOffset == 0 {
+				break
+			}
+			next := int(entry.NextEntryOffset)
+			if next < offset || next > len(buffer)-pos {
+				return 0, errors.New("invalid directory entry offset")
+			}
+			pos += next
+		}
+	}
+	return 0, errors.New("anchor was not found in bounded directory enumeration")
 }
 
 func openServiceTree(create bool) (*serviceTree, error) {

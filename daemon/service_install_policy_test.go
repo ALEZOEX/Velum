@@ -96,12 +96,27 @@ func TestServiceAncestorPolicy(t *testing.T) {
 	s := safeServiceSnapshot(true, "", false)
 	s.protected = false // System ancestors may legitimately inherit.
 	s.aces = append(s.aces, serviceACE{sid: "S-1-5-32-545", mask: 0x1200a9 | 4})
-	if err := validateServiceAncestor(s); err != nil {
+	if err := validateServiceAncestor(s, false); err != nil {
 		t.Fatal(err)
 	}
 	s.aces[len(s.aces)-1].mask |= 0x40 // FILE_DELETE_CHILD overrides child ACL.
-	if err := validateServiceAncestor(s); err == nil {
+	if err := validateServiceAncestor(s, true); err == nil {
 		t.Fatal("ancestor permits child replacement")
+	}
+}
+
+func TestServiceProgramDataAttributesRequireAnchor(t *testing.T) {
+	s := safeServiceSnapshot(true, "", false)
+	s.aces = append(s.aces, serviceACE{sid: "S-1-5-32-545", mask: 0x116, flags: 2})
+	if err := validateServiceAncestor(s, false); err == nil {
+		t.Fatal("attribute-writable empty ancestor accepted")
+	}
+	if err := validateServiceAncestor(s, true); err != nil {
+		t.Fatal(err)
+	}
+	s.aces[len(s.aces)-1].mask |= 0x40
+	if err := validateServiceAncestor(s, true); err == nil {
+		t.Fatal("anchor must not excuse DELETE_CHILD")
 	}
 }
 

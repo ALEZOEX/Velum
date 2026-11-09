@@ -72,7 +72,7 @@ func validateServiceObject(s serviceObjectSecurity, directory bool, reader strin
 	return nil
 }
 
-func validateServiceAncestor(s serviceObjectSecurity) error {
+func validateServiceAncestor(s serviceObjectSecurity, anchored bool) error {
 	if s.reparse || !s.directory || !s.daclPresent {
 		return errors.New("ancestor is a reparse point, non-directory or has a null DACL")
 	}
@@ -81,7 +81,7 @@ func validateServiceAncestor(s serviceObjectSecurity) error {
 	}
 	// Ancestors such as ProgramData may allow creation of subdirectories.
 	// DELETE_CHILD, ownership/ACL or attribute changes may redirect our tree.
-	const unsafe uint32 = 0x10000000 | 0x40000000 | 0x80000 | 0x40000 | 0x10000 | 0x100 | 0x10 | 0x40
+	const unsafe uint32 = 0x10000000 | 0x40000000 | 0x80000 | 0x40000 | 0x10000 | 0x40
 	for _, ace := range s.aces {
 		if ace.flags&8 != 0 || ace.kind == 1 {
 			continue
@@ -94,6 +94,9 @@ func validateServiceAncestor(s serviceObjectSecurity) error {
 		}
 		if ace.mask&unsafe != 0 {
 			return fmt.Errorf("ancestor permits replacement/ACL changes by %s", ace.sid)
+		}
+		if ace.mask&(0x100|0x10) != 0 && !anchored {
+			return fmt.Errorf("ancestor attribute-write ACE for %s requires a pinned nonempty-directory anchor", ace.sid)
 		}
 	}
 	return nil
