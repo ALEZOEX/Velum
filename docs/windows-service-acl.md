@@ -124,6 +124,9 @@ validation and amd64 FILE_RENAME_INFORMATION layout. Standard Windows CI runs
 these without service installation. A separate opt-in test exercises real NTFS
 creation, owner/DACL readback, reuse, failed-write cleanup, no-replace publication
 and rejection of a writable executable. It never registers/starts a service.
+The dedicated hosted Windows CI job also invokes this opt-in fixture through the
+VM-checking script on its disposable runner. Passing fixtures does not replace
+the separate SCM and standard-user negative matrix below.
 
 ## Disposable Windows 11 VM procedure
 

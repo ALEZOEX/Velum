@@ -39,6 +39,13 @@ jobs:
       - name: Native descriptor, path and install-policy tests (no SCM changes)
         working-directory: daemon
         run: go test -v -run '^TestService' ./...
+      - name: NTFS fixtures in disposable hosted Windows VM (no SCM changes)
+        working-directory: daemon
+        shell: pwsh
+        run: |
+          go test -c -o "$env:RUNNER_TEMP\velum-f1.test.exe" .
+          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture test compilation failed.' }
+          & ..\scripts\test-windows-service-acl.ps1 -TestBinary "$env:RUNNER_TEMP\velum-f1.test.exe" -DisposableVM
 
   flutter-windows:
     name: Flutter / Windows
