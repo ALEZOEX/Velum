@@ -18,6 +18,11 @@ if (Get-Service Velum -ErrorAction SilentlyContinue) {
   throw 'Use a clean VM without an installed Velum service.'
 }
 $binary = (Resolve-Path -LiteralPath $TestBinary).Path
+$systemData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+foreach ($ancestor in @([IO.Path]::GetPathRoot($systemData), $systemData)) {
+  $descriptor = Get-Acl -LiteralPath $ancestor
+  Write-Host "Read-only ancestor inspection: $ancestor owner=$($descriptor.Owner) sddl=$($descriptor.Sddl)"
+}
 $previous = $env:VELUM_F1_DISPOSABLE_VM
 try {
   $env:VELUM_F1_DISPOSABLE_VM = '1'
