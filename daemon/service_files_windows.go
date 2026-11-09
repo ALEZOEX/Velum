@@ -176,7 +176,11 @@ func serviceOpenAt(parent windows.Handle, name string, directory, create bool, s
 	}
 	var handle windows.Handle
 	var status windows.IO_STATUS_BLOCK
-	err = windows.NtCreateFile(&handle, access, &oa, &status, nil, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_SHARE_READ, disposition, options, 0, 0)
+	share := uint32(windows.FILE_SHARE_READ)
+	if directory {
+		share |= windows.FILE_SHARE_WRITE
+	}
+	err = windows.NtCreateFile(&handle, access, &oa, &status, nil, windows.FILE_ATTRIBUTE_NORMAL, share, disposition, options, 0, 0)
 	runtime.KeepAlive(sd)
 	if err != nil {
 		return 0, fmt.Errorf("open service component %q: %w", name, err)
@@ -214,7 +218,7 @@ func pinServicePath(path string, trusted bool) ([]windows.Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, err := windows.CreateFile(root, windows.FILE_GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	h, err := windows.CreateFile(root, windows.FILE_GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		return nil, err
 	}

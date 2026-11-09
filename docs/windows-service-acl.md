@@ -36,8 +36,10 @@ F12/F13 themselves are not evaluated or marked fixed here.
 2. Pin ancestors one component at a time. The volume root is opened with
    OPEN_REPARSE_POINT/BACKUP_SEMANTICS; subsequent NtCreateFile operations are
    relative to held directory handles with FILE_OPEN_REPARSE_POINT and
-   OBJ_DONT_REPARSE. Sharing permits readers only, denying write/delete handle
-   sharing. Every opened component is inspected for actual type and reparse flag.
+   OBJ_DONT_REPARSE. Directory handles permit read/write sharing required by native
+   rename bookkeeping but deny delete sharing; file handles deny write/delete
+   sharing. Sharing never grants access absent from the verified DACL. Every
+   opened component is inspected for actual type and reparse flag.
 3. Ancestors must be owned by SYSTEM, Administrators or TrustedInstaller. Their
    current-object ACEs must not grant nontrusted subjects DELETE_CHILD, DELETE,
    WRITE_DAC, WRITE_OWNER, generic write or generic all.
