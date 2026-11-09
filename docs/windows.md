@@ -17,10 +17,15 @@ Velum\
   README-WINDOWS.txt
 ```
 
-The service installer copies `velumd.exe`, `sing-box.exe` and `xray.exe` into
-`%ProgramData%\Velum\bin`. The service never executes binaries from the
-user-writable release directory, because that would let a standard user replace
-the executable and gain LocalSystem privileges.
+The service installer publishes `velumd.exe`, `sing-box.exe` and `xray.exe` into
+the system Known Folder ProgramData directory, under `Velum\bin`. The installer
+does not use the `ProgramData` environment variable for privileged destinations.
+Local NTFS is required. Reparse points, unsafe ancestors, unexpected children,
+hard-linked files and pre-existing objects outside the controlled owner/DACL
+policy cause refusal without automatic ACL repair or overwrite.
+
+**F1 remains pending Windows filesystem/SCM runtime validation.** See the
+[security design and disposable Windows 11 validation procedure](windows-service-acl.md).
 
 ## Installation
 
@@ -57,7 +62,10 @@ In a packaged build:
 .\bin\velumd.exe --service uninstall
 ```
 
-The token and user profiles are kept. Removing them is a manual decision.
+The token and user profiles are kept. Uninstall validates the known tree before
+touching SCM, then deletes only verified binary handles and an empty bin
+directory. It does not recursively traverse directories. Unsafe trees are
+preserved and require administrator diagnosis; uninstall refuses them.
 
 ## Service account and token
 
@@ -67,12 +75,29 @@ driver, creating the adapter and changing routes requires privileges that
 operator to provide a different account, but that account must then be granted
 the same network privileges and read access to the token.
 
-The service token lives in `%ProgramData%\Velum\token`. Its ACL removes
-inheritance and grants:
+The service token lives in the system Known Folder `ProgramData\Velum\token`.
+External `--token-file` destinations are refused by service installation. Newly
+created objects receive owner BUILTIN\Administrators and a complete protected
+DACL. The actual owner/DACL are read back through handles before SCM registration
+and again before starting the service. Token grants are:
 
 - `NT AUTHORITY\SYSTEM`: full control
 - `BUILTIN\Administrators`: full control
-- the installing user: read
+- the elevated installing identity: read
+
+Directories/binaries grant that identity read/execute; no other ACEs are accepted.
+An existing verified binary is reused only if its SHA-256 matches the held source
+file; differing binaries require uninstall first. New files are written to
+exclusive staging objects and renamed without replacement. Partial failures
+before registration leave no registered service and only already verified
+published files. A safe retry can reuse those files. A process crash may leave
+an unknown staging file, which is preserved and causes subsequent refusal.
+
+Legacy installations with a different owner/DACL are intentionally not silently
+migrated. Do not solve refusal by recursively resetting permissions or deleting
+links. Inspect the original audit finding and the VM migration checklist first.
+Token delegation to another GUI identity and source-package authenticity are
+outside this F1 change. F12 and F13 were not independently evaluated or closed.
 
 The REST API keeps Bearer authentication and binds only to `127.0.0.1:27841`.
 There is no remote listener and no unauthenticated administrative endpoint.

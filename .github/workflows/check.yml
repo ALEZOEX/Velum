@@ -27,6 +27,19 @@ jobs:
       - name: Smoke-build daemon (windows cross)
         run: cd daemon && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ../bin/velumd.exe .
 
+  daemon-windows-unit:
+    name: Windows service security unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: daemon/go.sum
+      - name: Native descriptor, path and install-policy tests (no SCM changes)
+        working-directory: daemon
+        run: go test -v -run '^TestService' ./...
+
   flutter-windows:
     name: Flutter / Windows
     runs-on: windows-latest

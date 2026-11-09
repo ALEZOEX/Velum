@@ -26,5 +26,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Velum service: $Action completed."
 if ($Action -eq 'install') {
-  Write-Host 'The GUI token is stored in %ProgramData%\Velum\token and is readable by the installing user.'
+  $systemData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+  Write-Host "The GUI token is stored in $systemData\Velum\token and is readable by the elevated installing identity."
+  Write-Host 'Existing unsafe service objects are refused; this installer does not repair their owner or ACL.'
 }
