@@ -55,6 +55,9 @@ type service struct {
 	uploadTotal, downloadTotal, uploadRate, downloadRate *int64
 	sampleAt                                             time.Time
 	logs                                                 logBuffer
+
+	// Defaults to the read-only platform preflight; injectable for tests.
+	tunPreflight func(map[string]any) error
 }
 
 func (s *service) stopCore() {
@@ -203,7 +206,25 @@ func (s *service) connectRequest(req ConnectRequest) error {
 			return err
 		}
 	}
+	checkTUN := s.tunPreflight
+	if checkTUN == nil {
+		checkTUN = checkTUNResources
+	}
+	// Reject conflicts before stopping a proxy-only connection. An existing
+	// owned TUN must first close so its resources are no longer in the dump.
+	if tun && (s.cmd == nil || !s.tunActive) {
+		if err = checkTUN(cfg); err != nil {
+			return err
+		}
+	}
 	s.stopCore()
+	// Recheck after teardown and immediately before any new child starts.
+	// Never try to repair/flush occupied resources, even after a crash.
+	if tun {
+		if err = checkTUN(cfg); err != nil {
+			return err
+		}
+	}
 	if err = os.Rename(candidate, path); err != nil {
 		return err
 	}

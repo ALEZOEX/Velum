@@ -150,6 +150,11 @@ func TestWindowsTunConfigKeepsStrictRouteAndExcludesServer(t *testing.T) {
 	if tunInbound["interface_name"] != "Velum" || tunInbound["strict_route"] != true {
 		t.Fatalf("unexpected Windows tun inbound: %#v", tunInbound)
 	}
+	for _, key := range []string{"iproute2_table_index", "iproute2_rule_index"} {
+		if _, exists := tunInbound[key]; exists {
+			t.Fatalf("Linux-only routing option %s leaked into Windows config", key)
+		}
+	}
 	if err = excludeTunServer(cfg, "192.0.2.1"); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +171,18 @@ func TestWindowsTunConfigKeepsStrictRouteAndExcludesServer(t *testing.T) {
 	}
 	if primaryServer(cfg) != "192.0.2.1" {
 		t.Fatal("primary server was not read from the config")
+	}
+	checkCoreConfig(t, cfg)
+}
+
+func TestLinuxTunRoutingNamespace(t *testing.T) {
+	cfg, err := buildConfigForOS(map[string]any{"type": "socks", "tag": "proxy", "server": "192.0.2.1", "server_port": 1080}, true, "", ConnectionSettings{}, "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound := cfg["inbounds"].([]any)[1].(map[string]any)
+	if inbound["iproute2_table_index"] != 27841 || inbound["iproute2_rule_index"] != 27841 {
+		t.Fatalf("Linux TUN must not use shared sing-tun defaults: %#v", inbound)
 	}
 	checkCoreConfig(t, cfg)
 }

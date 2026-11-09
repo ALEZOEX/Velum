@@ -9,6 +9,15 @@ import (
 	"strings"
 )
 
+// Application-local convention, not an OS reservation. Linux preflight must
+// verify both families before every TUN start. sing-tun v0.7.3 deletes the
+// entire inclusive rule interval [index, index+10], including unused slots.
+const (
+	linuxTUNTable     = 27841
+	linuxTUNRuleStart = 27841
+	linuxTUNRuleEnd   = linuxTUNRuleStart + 10
+)
+
 type RouteRule struct {
 	Action string `json:"action"`
 	Type   string `json:"type"`
@@ -195,7 +204,7 @@ func buildConfigForOS(out map[string]any, tun bool, interfaceName string, s Conn
 				mtu = 1500
 			}
 		}
-		inbounds = append(inbounds, map[string]any{
+		tunInbound := map[string]any{
 			"type":           "tun",
 			"tag":            "tun",
 			"interface_name": tunName,
@@ -203,7 +212,12 @@ func buildConfigForOS(out map[string]any, tun bool, interfaceName string, s Conn
 			"mtu":            mtu,
 			"auto_route":     true,
 			"strict_route":   strictRoute,
-		})
+		}
+		if goos == "linux" {
+			tunInbound["iproute2_table_index"] = linuxTUNTable
+			tunInbound["iproute2_rule_index"] = linuxTUNRuleStart
+		}
+		inbounds = append(inbounds, tunInbound)
 	}
 	rules := []any{map[string]any{"action": "sniff"}, map[string]any{"protocol": "dns", "action": "hijack-dns"}}
 	dnsRules := []any{}
