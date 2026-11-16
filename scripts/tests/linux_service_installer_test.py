@@ -21,7 +21,7 @@ POLICY = installer.POLICY
 
 class InstallerTest(unittest.TestCase):
     def setUp(self):
-        # The launcher masks these paths with private tmpfs. Never offer an
+        # The launcher masks these paths with a private tmpfs chroot. Never offer an
         # environment switch to redirect the privileged production installer.
         self.assertEqual(os.geteuid(), 0)
         status = Path('/proc/self/status').read_text()
@@ -29,7 +29,7 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue(capabilities & 1, 'Fixture needs CAP_CHOWN: ' + status + Path('/proc/self/uid_map').read_text())
         self.assertTrue(Path('/run/source/scripts/tests/linux_service_installer_test.py').is_file())
         self.assertFalse(Path('/etc/os-release').exists())
-        # Auto-created bwrap parents are private (0700). Make only private
+        # Private namespace parents may inherit a restrictive umask. Make only
         # tmpfs ancestors searchable so refusal is tested inside the installer.
         for folder in ('/', '/usr', '/tmp', '/home', '/run', '/etc'):
             self.assertEqual(Path(folder).stat().st_dev, Path('/').stat().st_dev)

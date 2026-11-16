@@ -164,7 +164,7 @@ policy, системный токен и прежнее enabled/active сост�
 
 ```bash
 # Без sudo: отдельные user/mount/PID/network namespaces и временная файловая система.
-# Нужны bubblewrap, util-linux, iproute2, Python 3, настроенные subordinate UID/GID.
+# Нужны util-linux (unshare/mount), chroot, iproute2, Python 3, настроенные subordinate UID/GID.
 ./scripts/test-linux-service-installer.sh
 ```
 
