@@ -1,6 +1,10 @@
 .PHONY: core xray daemon daemon-windows test test-windows test-network
 core:
+ifeq ($(shell go env GOHOSTOS),linux)
+	python3 scripts/build-linux-core.py
+else
 	GOBIN=$(CURDIR)/bin go install -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.12.12" -tags with_utls,with_quic,with_clash_api github.com/sagernet/sing-box/cmd/sing-box@v1.12.12
+endif
 daemon:
 	cd daemon && go build -o ../bin/velumd .
 daemon-windows:

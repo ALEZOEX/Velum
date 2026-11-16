@@ -1,0 +1,8 @@
+--- a/option/tun.go
++++ b/option/tun.go
+@@ -13,0 +14 @@
++	FileDescriptor int `json:"file_descriptor,omitempty"`
+--- a/protocol/tun/inbound.go
++++ b/protocol/tun/inbound.go
+@@ -195,0 +196 @@
++			FileDescriptor:           options.FileDescriptor,
