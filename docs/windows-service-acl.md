@@ -1,11 +1,17 @@
 # F1: Windows service installation boundary
 
-Status: implemented candidate, **not confirmed fully closed**. Native NTFS,
+Status: reviewed for alpha acceptance, **not confirmed fully closed**. Native NTFS,
 real SCM lifecycle and standard-user access checks have passed on a disposable
 hosted Windows Server 2025 VM. The full adversarial matrix below and Windows 11
 GUI/UAC installation remain pending. Linux mocks, Windows cross-compilation,
 Wine and in-memory descriptor tests alone are insufficient. No service or VPN
 was installed on the developer's Linux machine or a physical Windows host.
+
+The [final source review](windows-service-acl-review.md) of PR #1 at
+`b13ea1481ecd147059b2f3904e983ae939c8f36c` found no blocking F1 defect within
+the stated non-administrator threat model. Acceptance remains conditional on
+green CI for the actual merge candidate. This is not a Windows 11 GUI/UAC or
+production security certification; the outstanding matrix remains open.
 
 ## Threat model and root cause
 
