@@ -22,7 +22,9 @@ fi
 ip link set lo up  # Only the new, verified network namespace.
 extra=()
 [[ ! -d /usr/lib64 || -L /usr/lib64 ]] || extra+=(--ro-bind /usr/lib64 /usr/lib64)
-exec bwrap --die-with-parent --unshare-pid --tmpfs / \
+exec bwrap --die-with-parent --unshare-pid \
+  --cap-add CAP_CHOWN --cap-add CAP_FOWNER --cap-add CAP_DAC_OVERRIDE \
+  --cap-add CAP_SETUID --cap-add CAP_SETGID --tmpfs / \
   --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib "${extra[@]}" \
   --symlink usr/bin /bin --symlink usr/bin /sbin \
   --symlink usr/lib /lib --symlink "$(readlink /lib64 || printf usr/lib64)" /lib64 \
