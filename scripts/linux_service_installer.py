@@ -141,11 +141,56 @@ class Directory:
                 os.unlink(temporary, dir_fd=self.fd)
 
     def restore(self, name, snapshot):
+        if self.snapshot(name) == snapshot:
+            return
         if snapshot is None:
             if self.exists(name):
                 os.unlink(name, dir_fd=self.fd)
         else:
             self.write(name, *snapshot)
+
+
+class RecoveryBackup:
+    """Private originals survive even if restoring them fails. No auto replay."""
+    def __init__(self, parent, snapshots, state):
+        self.parent = parent
+        self.name = '.velum-recovery-' + secrets.token_hex(12)
+        os.mkdir(self.name, 0o700, dir_fd=parent.fd)
+        self.directory = Directory(parent.path / self.name)
+        self.names = {'unit', 'policy', 'token', 'state.json'}
+        try:
+            state['modes'] = {}
+            for name, snapshot in snapshots.items():
+                state['modes'][name] = snapshot[1] if snapshot else None
+                if snapshot:
+                    self.directory.write(name, snapshot[0], 0o600)
+            self.directory.write('state.json', json.dumps(state, sort_keys=True).encode() + b'\n', 0o600)
+            os.fsync(parent.fd)
+        except BaseException:
+            try:
+                self.discard()
+            finally:
+                self.directory.close()
+            raise
+
+    def discard(self):
+        check_info(os.fstat(self.directory.fd), self.directory.path, (0,), directory=True, private=True)
+        names = set(os.listdir(self.directory.fd))
+        if not names <= self.names:
+            raise InstallError(f'Unknown files in recovery backup: {self.directory.path}')
+        for name in names:
+            self.directory.snapshot(name)  # Refuse unsafe objects, including links.
+        for name in names:
+            os.unlink(name, dir_fd=self.directory.fd)
+        os.rmdir(self.name, dir_fd=self.parent.fd)
+
+
+def clear_recovery(recovery):
+    if recovery is not None:
+        try:
+            recovery.discard()
+        except (OSError, InstallError) as error:
+            print(f'Velum: completed transaction; private recovery backup retained at {recovery.directory.path}: {error}', file=sys.stderr)
 
 
 def tree(path):
@@ -325,6 +370,10 @@ def transact(args, script):
             was_enabled = systemctl('is-enabled', '--quiet', 'velum.service', check=False)
             saved_name = '.velum-remove-' + secrets.token_hex(12)
             moved = False
+            recovery = RecoveryBackup(config_parent, {'unit': old_unit, 'policy': old_policy, 'token': old_token},
+                                      {'action': 'uninstall', 'active': was_active, 'enabled': was_enabled,
+                                       'binary_backup': str(parent.path / saved_name)})
+            handles.append(recovery.directory)
             try:
                 systemctl('disable', '--now', 'velum.service')
                 os.rename(BASE.name, saved_name, src_dir_fd=parent.fd, dst_dir_fd=parent.fd)
@@ -348,8 +397,10 @@ def transact(args, script):
                         systemctl('start', 'velum.service')
                         ready()
                 except BaseException as rollback_error:
-                    raise InstallError(f'{error}; UNINSTALL ROLLBACK INCOMPLETE: {rollback_error}. Review {BASE} and {parent.path / saved_name}') from error
+                    raise InstallError(f'{error}; UNINSTALL ROLLBACK INCOMPLETE: {rollback_error}. Review {BASE}, {parent.path / saved_name} and private originals {recovery.directory.path}') from error
+                clear_recovery(recovery)
                 raise
+            clear_recovery(recovery)
             # Commit precedes deleting any binary. Delete only the validated
             # leaf set, never rm -rf or unrelated files under /etc/velum.
             try:
@@ -402,6 +453,7 @@ def transact(args, script):
         os.mkdir(stage_name, 0o700, dir_fd=parent.fd)
         stage = pin(parent.path / stage_name)
         moved_old = published = config_created = touched = False
+        recovery = None
         try:
             hashes = {}
             for name, (data, _) in payload.items():
@@ -410,6 +462,11 @@ def transact(args, script):
             manifest = {'format': 1, 'files': hashes, 'gui_uid': args.uid}
             stage.write('manifest.json', json.dumps(manifest, sort_keys=True).encode() + b'\n', 0o644)
             os.fchmod(stage.fd, 0o755)
+            recovery = RecoveryBackup(config_parent, {'unit': old_unit, 'policy': old_policy, 'token': old_token},
+                                      {'action': 'install', 'active': was_active, 'enabled': was_enabled,
+                                       'config_existed': config is not None, 'stage': str(stage.path),
+                                       'binary_backup': str(parent.path / saved_name)})
+            handles.append(recovery.directory)
             if was_active:
                 systemctl('stop', 'velum.service')
             touched = True
@@ -456,8 +513,10 @@ def transact(args, script):
             if parent.exists(stage_name):
                 remove_tree(parent, stage_name)
             if rollback_errors:
-                raise InstallError(f'{error}; ROLLBACK INCOMPLETE: {rollback_errors}. Review {BASE} and retained backups at {parent.path / saved_name} for manual recovery') from error
+                raise InstallError(f'{error}; ROLLBACK INCOMPLETE: {rollback_errors}. Review {BASE} and retained backups at {parent.path / saved_name}; private originals at {recovery.directory.path} for manual recovery') from error
+            clear_recovery(recovery)
             raise
+        clear_recovery(recovery)
         if moved_old:
             try:
                 remove_tree(parent, saved_name)

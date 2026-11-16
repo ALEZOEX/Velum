@@ -24,6 +24,9 @@ class InstallerTest(unittest.TestCase):
         # The launcher masks these paths with private tmpfs. Never offer an
         # environment switch to redirect the privileged production installer.
         self.assertEqual(os.geteuid(), 0)
+        status = Path('/proc/self/status').read_text()
+        capabilities = int(status.split('CapEff:')[1].splitlines()[0], 16)
+        self.assertTrue(capabilities & 1, 'Fixture needs CAP_CHOWN: ' + status + Path('/proc/self/uid_map').read_text())
         self.assertTrue(Path('/run/source/scripts/tests/linux_service_installer_test.py').is_file())
         self.assertFalse(Path('/etc/os-release').exists())
         # Auto-created bwrap parents are private (0700). Make only private
@@ -65,6 +68,8 @@ class InstallerTest(unittest.TestCase):
         for path in (UNIT, POLICY):
             path.unlink(missing_ok=True)
         shutil.rmtree('/home/gui')
+        for path in Path('/etc').glob('.velum-recovery-*'):
+            shutil.rmtree(path)
         for path in Path('/run').glob('*'):
             if path.is_file():
                 path.unlink()
@@ -115,6 +120,7 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue(Path('/run/enabled').exists())
         self.assertEqual(stat.S_IMODE(Path('/etc/velum').stat().st_mode), 0o700)
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
 
     def test_control_install_token_override_and_reinstall(self):
         self.invoke('--no-start')
@@ -174,6 +180,7 @@ class InstallerTest(unittest.TestCase):
         self.assertFalse(Path('/run/active').exists())
         self.assertFalse(Path('/run/enabled').exists())
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
         self.invoke('--no-start')
 
     def test_no_start_does_not_start_a_service(self):
@@ -271,6 +278,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(calls, self.calls()[:-2])  # Only read-only state queries.
         self.assertTrue(Path('/run/active').exists())
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
 
     def test_uninstall_reload_failure_restores_service_and_all_files(self):
         self.invoke()
@@ -281,6 +289,7 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue(Path('/run/active').exists())
         self.assertTrue(Path('/run/enabled').exists())
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
         self.invoke('uninstall', script=BASE / 'velum-service-control')
 
     def test_token_publication_failure_restores_previous_installation(self):
@@ -302,6 +311,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertTrue(Path('/run/active').exists())
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
 
     def test_extended_acl_rejected_without_repair(self):
         self.invoke('--no-start')
@@ -359,6 +369,38 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual(self.snapshot(), {})
             self.assertFalse(any(x[0] in ('stop', 'disable', 'start') for x in self.calls()))
             self.assertEqual(listener.getsockname(), ('127.0.0.1', 27841))
+
+    def test_incomplete_rollback_preserves_private_original_token_and_files(self):
+        self.invoke()
+        original_token = Path('/etc/velum/token').read_bytes()
+        original_unit = UNIT.read_bytes()
+        self.token.write_text('b' * 64)
+        args = installer.argparse.Namespace(action='install', uid=1000, token_file=str(self.token),
+                                            bin_dir=None, interface='', no_start=False)
+        original = installer.Directory.write
+        publication_failed = False
+        def fail_publication_and_rollback(directory, name, *values):
+            nonlocal publication_failed
+            if directory.path == UNIT.parent and name == UNIT.name and not publication_failed:
+                publication_failed = True
+                raise OSError('injected unit publication error')
+            if publication_failed and directory.path == installer.CONFIG and name == 'token':
+                raise OSError('injected persistent token restore failure')
+            return original(directory, name, *values)
+        with mock.patch.object(installer.Directory, 'write', fail_publication_and_rollback):
+            with self.assertRaisesRegex(installer.InstallError, 'ROLLBACK INCOMPLETE') as error:
+                installer.transact(args, str(self.repo / 'scripts/linux_service_installer.py'))
+        backups = list(Path('/etc').glob('.velum-recovery-*'))
+        self.assertEqual(len(backups), 1)
+        backup = backups[0]
+        self.assertIn(str(backup), str(error.exception))
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o700)
+        self.assertEqual((backup / 'token').read_bytes(), original_token)
+        self.assertEqual((backup / 'unit').read_bytes(), original_unit)
+        self.assertEqual(stat.S_IMODE((backup / 'token').stat().st_mode), 0o600)
+        self.assertEqual(backup.stat().st_uid, 0)
+        self.assertFalse(Path('/run/active').exists())
+        self.assertEqual(json.loads((backup / 'state.json').read_text())['active'], True)
 
     def test_legacy_installation_can_be_upgraded_without_manifest(self):
         self.invoke('--no-start')
