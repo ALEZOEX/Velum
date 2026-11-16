@@ -8,14 +8,10 @@ import (
 	"syscall"
 )
 
-// configureChild applies Linux-specific process lifetime attributes to child processes.
-// SysProcAttr.Pdeathsig = syscall.SIGTERM instructs the Linux kernel to deliver
-// SIGTERM to the child process immediately if the parent (velumd) terminates for any
-// reason (including SIGKILL, panic, or unhandled crash).
-//
-// Setpgid is deliberately omitted: moving the child into an independent process
-// group does not clean it up and would detach it from terminal signal delivery
-// in console mode. Pdeathsig operates at kernel level independently of process groups.
+// Pdeathsig is tied to the spawning OS thread and requests a signal, not
+// guaranteed cleanup. The TUN supervisor pins that thread and also uses an
+// EOF lifeline and a durable journal; it deliberately has no Pdeathsig itself.
+// Keep children in the terminal/systemd process group.
 func configureChild(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}

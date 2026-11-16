@@ -9,9 +9,8 @@ import (
 	"strings"
 )
 
-// Application-local convention, not an OS reservation. Linux preflight must
-// verify both families before every TUN start. sing-tun v0.7.3 deletes the
-// entire inclusive rule interval [index, index+10], including unused slots.
+// Application-local convention, not an OS reservation. Linux ownership uses
+// exact session-tagged objects; preflight still rejects existing conflicts.
 const (
 	linuxTUNTable     = 27841
 	linuxTUNRuleStart = 27841
@@ -214,6 +213,7 @@ func buildConfigForOS(out map[string]any, tun bool, interfaceName string, s Conn
 			"strict_route":   strictRoute,
 		}
 		if goos == "linux" {
+			tunInbound["file_descriptor"] = 3
 			tunInbound["iproute2_table_index"] = linuxTUNTable
 			tunInbound["iproute2_rule_index"] = linuxTUNRuleStart
 		}

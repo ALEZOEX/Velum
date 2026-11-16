@@ -46,7 +46,7 @@ func TestAuthorizationAndMalformedInput(t *testing.T) {
 	}
 }
 func TestRealCoreConfig(t *testing.T) {
-	core, e := filepath.Abs("../bin/sing-box")
+	core, e := filepath.Abs(testCoreBinary())
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -74,7 +74,7 @@ func TestRealCoreConfig(t *testing.T) {
 	}
 }
 func TestCoreLifecycle(t *testing.T) {
-	core, _ := filepath.Abs("../bin/sing-box")
+	core, _ := filepath.Abs(testCoreBinary())
 	if _, e := os.Stat(core); e != nil {
 		t.Skip("build pinned sing-box")
 	}
@@ -114,7 +114,7 @@ func TestExclusionValidation(t *testing.T) {
 }
 
 func TestBuiltCoreVersion(t *testing.T) {
-	core, _ := filepath.Abs("../bin/sing-box")
+	core, _ := filepath.Abs(testCoreBinary())
 	if _, err := os.Stat(core); err != nil {
 		t.Skip("build pinned sing-box")
 	}
@@ -132,7 +132,7 @@ func TestExplicitInterfaceConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	core, _ := filepath.Abs("../bin/sing-box")
+	core, _ := filepath.Abs(testCoreBinary())
 	if _, err = os.Stat(core); err != nil {
 		t.Skip("build pinned sing-box")
 	}

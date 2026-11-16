@@ -20,16 +20,27 @@ type tunResourceReader interface {
 	RouteListFiltered(int, *netlink.Route, uint64) ([]netlink.Route, error)
 }
 
-func checkTUNResources(cfg map[string]any) error {
-	handle, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+func newTUNReader() (*netlink.Handle, error) {
+	h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 	if err != nil {
-		return fmt.Errorf("TUN не запущен: невозможно открыть netlink для проверки ресурсов: %w", err)
+		return nil, err
 	}
-	defer handle.Close()
-	if err = handle.SetSocketTimeout(2 * time.Second); err != nil {
-		return fmt.Errorf("TUN не запущен: невозможно ограничить время проверки netlink: %w", err)
+	if err = h.SetSocketTimeout(2 * time.Second); err != nil {
+		h.Close()
+		return nil, err
 	}
-	return checkLinuxTUNResources(cfg, handle)
+	return h, nil
+}
+func checkTUNResources(cfg map[string]any) error {
+	lease, err := acquireTUNLease()
+	if err != nil {
+		return err
+	}
+	defer lease.close()
+	if err = lease.recover(); err != nil {
+		return err
+	}
+	return checkTUNWithLease(cfg)
 }
 
 func checkLinuxTUNResources(cfg map[string]any, reader tunResourceReader) error {
@@ -44,13 +55,13 @@ func checkLinuxTUNResources(cfg map[string]any, reader tunResourceReader) error 
 			tun = inbound
 		}
 	}
-	if tun == nil || tun["interface_name"] != "velum0" || tun["auto_route"] != true ||
+	if tun == nil || tun["interface_name"] != "velum0" || tun["auto_route"] != true || tun["strict_route"] != true || tun["file_descriptor"] != 3 ||
 		tun["iproute2_table_index"] != linuxTUNTable || tun["iproute2_rule_index"] != linuxTUNRuleStart {
 		return errors.New("TUN не запущен: конфигурация не использует проверяемые ресурсы Velum")
 	}
 	// These options require additional resources/priority calculations. Refuse
 	// future config changes rather than silently checking an incomplete set.
-	for _, key := range []string{"auto_redirect", "include_interface", "exclude_interface", "include_uid", "exclude_uid", "include_uid_range", "exclude_uid_range", "include_android_user", "include_package", "exclude_package"} {
+	for _, key := range []string{"route_address", "route_address_set", "route_exclude_address_set", "loopback_address", "auto_redirect", "include_interface", "exclude_interface", "include_uid", "exclude_uid", "include_uid_range", "exclude_uid_range", "include_android_user", "include_package", "exclude_package"} {
 		if _, exists := tun[key]; exists {
 			return fmt.Errorf("TUN не запущен: проверка ресурсов не поддерживает %s", key)
 		}
@@ -76,8 +87,8 @@ func checkLinuxTUNResources(cfg map[string]any, reader tunResourceReader) error 
 			return errors.New("TUN не запущен: интерфейс velum0 уже существует; его владелец неизвестен, автоматическое удаление запрещено")
 		}
 	}
-	// Both families are mandatory even with IPv6 disabled: strict_route may add
-	// an unreachable IPv6 rule, and unsetRules scans FAMILY_ALL regardless.
+	// Both families are mandatory: IPv6-disabled mode installs an owned
+	// unreachable IPv6 rule. No priority-based cleanup is ever performed.
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		label := "IPv4"
 		if family == netlink.FAMILY_V6 {

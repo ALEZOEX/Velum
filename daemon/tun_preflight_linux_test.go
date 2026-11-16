@@ -157,7 +157,7 @@ func TestTUNPreflightFailsClosedOnInspectionError(t *testing.T) {
 }
 
 func TestTUNPreflightRejectsUnsupportedConfig(t *testing.T) {
-	for _, key := range []string{"auto_redirect", "iproute2_table_index", "iproute2_rule_index", "interface_name", "auto_route", "include_uid", "address"} {
+	for _, key := range []string{"auto_redirect", "route_address", "route_address_set", "route_exclude_address_set", "strict_route", "file_descriptor", "iproute2_table_index", "iproute2_rule_index", "interface_name", "auto_route", "include_uid", "address"} {
 		t.Run(key, func(t *testing.T) {
 			cfg := tunTestConfig(t, true)
 			cfg["inbounds"].([]any)[1].(map[string]any)[key] = "unexpected"

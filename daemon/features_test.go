@@ -15,7 +15,7 @@ import (
 
 func checkCoreConfig(t *testing.T, cfg map[string]any) {
 	t.Helper()
-	core, _ := filepath.Abs("../bin/sing-box")
+	core, _ := filepath.Abs(testCoreBinary())
 	if _, e := os.Stat(core); e != nil {
 		t.Skip("build pinned core")
 	}
@@ -195,4 +195,11 @@ func TestCompanionServerExtraction(t *testing.T) {
 	if got := companionServer(nil); got != "" {
 		t.Fatalf("nil companion must return an empty address, got %q", got)
 	}
+}
+
+func testCoreBinary() string {
+	if core := os.Getenv("VELUM_TEST_CORE"); core != "" {
+		return core
+	}
+	return "../bin/sing-box"
 }

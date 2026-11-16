@@ -42,6 +42,9 @@ type service struct {
 	state, lastError, core, interfaceName, dir, token    string
 	tun                                                  bool
 	tunActive                                            bool
+	tunManaged                                           bool
+	tunLife                                              io.Closer
+	tunCleanupErr                                        error
 	proxyPort                                            int
 	connectedAt                                          time.Time
 	verified                                             bool
@@ -56,11 +59,15 @@ type service struct {
 	sampleAt                                             time.Time
 	logs                                                 logBuffer
 
-	// Defaults to the read-only platform preflight; injectable for tests.
+	// Defaults to platform recovery + preflight; injectable for tests.
 	tunPreflight func(map[string]any) error
 }
 
 func (s *service) stopCore() {
+	if s.tunLife != nil {
+		s.tunLife.Close()
+		s.tunLife = nil
+	}
 	if s.cmd != nil {
 		select {
 		case <-s.done:
@@ -83,7 +90,19 @@ func (s *service) stopCore() {
 		_ = os.Remove(filepath.Join(s.dir, "xray.json"))
 	}
 	s.cmd = nil
+	s.tunCleanupErr = nil
+	if s.tunManaged {
+		s.tunCleanupErr = recoverTUN()
+		if s.tunCleanupErr == nil {
+			s.tunManaged = false
+			s.tunActive = false
+		}
+	}
 	s.state = "disconnected"
+	if s.tunCleanupErr != nil {
+		s.state = "error"
+		s.lastError = s.tunCleanupErr.Error()
+	}
 	s.verified = false
 	s.latencyMs = nil
 	s.connectedAt = time.Time{}
@@ -91,12 +110,16 @@ func (s *service) stopCore() {
 	s.apiSecret = ""
 	s.activeInterface = ""
 }
-func (s *service) stop() {
+func (s *service) stop() error {
 	s.desired = nil
 	s.reconnectAttempts = 0
 	s.stopCore()
+	if s.tunCleanupErr != nil {
+		return s.tunCleanupErr
+	}
 	s.lastError = ""
 	s.logs.add("info", "Соединение остановлено")
+	return nil
 }
 func (s *service) connect(uri string, exclusions ...string) error {
 	return s.connectRequest(ConnectRequest{URI: uri, Exclusions: exclusions})
@@ -183,6 +206,10 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	}
 	secret := hex.EncodeToString(random)
 	cfg["experimental"] = map[string]any{"clash_api": map[string]any{"external_controller": address, "secret": secret, "access_control_allow_origin": []string{"http://localhost.invalid"}}}
+	if tun && runtime.GOOS == "linux" && activeInterface != "" {
+		route := cfg["route"].(map[string]any)
+		route["default_interface"], route["auto_detect_interface"] = activeInterface, false
+	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -218,8 +245,11 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		}
 	}
 	s.stopCore()
+	if s.tunCleanupErr != nil {
+		return s.tunCleanupErr
+	}
 	// Recheck after teardown and immediately before any new child starts.
-	// Never try to repair/flush occupied resources, even after a crash.
+	// Only a validated journal permits recovery; preflight refuses unowned resources.
 	if tun {
 		if err = checkTUN(cfg); err != nil {
 			return err
@@ -250,22 +280,36 @@ func (s *service) connectRequest(req ConnectRequest) error {
 			return err
 		}
 	}
-	cmd.Stdout = &s.logs
-	cmd.Stderr = &s.logs
-	configureChild(cmd)
-	if err = cmd.Start(); err != nil {
-		return errors.New("Не удалось запустить sing-box")
-	}
-	if err = afterStart(cmd); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		s.logs.add("error", err.Error())
-		return errors.New("Не удалось привязать sing-box к задаче службы")
+	var done chan struct{}
+	if tun && runtime.GOOS == "linux" {
+		var life io.Closer
+		s.tunManaged = true
+		cmd, done, life, activeInterface, err = startManagedTUN(s.core, path, &s.logs)
+		if err != nil {
+			s.stopCore()
+			return errors.Join(err, s.tunCleanupErr)
+		}
+		s.tunLife = life
+	} else {
+		cmd.Stdout = &s.logs
+		cmd.Stderr = &s.logs
+		configureChild(cmd)
+		if err = cmd.Start(); err != nil {
+			return errors.New("Не удалось запустить sing-box")
+		}
+		if err = afterStart(cmd); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			s.logs.add("error", err.Error())
+			return errors.New("Не удалось привязать sing-box к задаче службы")
+		}
+		s.cmd = cmd
+		s.done = make(chan struct{})
+		done = s.done
+		go func() { _ = cmd.Wait(); close(done) }()
 	}
 	s.cmd = cmd
-	s.done = make(chan struct{})
-	done := s.done
-	go func() { _ = cmd.Wait(); close(done) }()
+	s.done = done
 	select {
 	case <-done:
 		s.cmd = nil
@@ -414,6 +458,9 @@ func (s *service) inspectProcess() {
 	}
 	if message != "" {
 		s.stopCore()
+		if s.tunCleanupErr != nil {
+			message = errors.Join(errors.New(message), s.tunCleanupErr).Error()
+		}
 		s.state = "error"
 		s.lastError = message
 		s.logs.add("error", message)
@@ -429,6 +476,9 @@ func (s *service) inspectInterface() {
 	}
 	message := fmt.Sprintf("Исходящий интерфейс %s больше не доступен", s.activeInterface)
 	s.stopCore()
+	if s.tunCleanupErr != nil {
+		message = errors.Join(errors.New(message), s.tunCleanupErr).Error()
+	}
 	s.state = "error"
 	s.lastError = message
 	s.logs.add("error", message)
@@ -557,7 +607,7 @@ func (s *service) handler(w http.ResponseWriter, r *http.Request) {
 			err = s.connectRequest(req)
 		}
 	case r.Method == "POST" && r.URL.Path == "/v1/disconnect":
-		s.stop()
+		err = s.stop()
 	case r.Method == "POST" && r.URL.Path == "/v1/reconnect":
 		if s.desired == nil {
 			err = errors.New("Нет последнего соединения")
@@ -696,6 +746,10 @@ func prepareDaemon(cfg daemonConfig) (*daemonRuntime, error) {
 			managedBy = "console"
 		}
 	}
+	if err := recoverAllowedTUN(cfg.tunAllowed); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
 	s := &service{xray: cfg.xray, core: cfg.core, interfaceName: cfg.interfaceName, tun: cfg.tunAllowed, dir: dir, token: token, state: "disconnected", serviceMode: managedBy}
 	listener, err := net.Listen("tcp4", "127.0.0.1:27841")
 	if err != nil {
@@ -715,17 +769,24 @@ func (d *daemonRuntime) serve(ctx context.Context) error {
 	cancel()
 	d.svc.mu.Lock()
 	tunWasActive := d.svc.tunActive
-	d.svc.stop()
+	stopErr := d.svc.stop()
 	d.svc.mu.Unlock()
 	cleanupNetworkState(tunWasActive)
 	_ = os.RemoveAll(d.dir)
 	if err != nil && err != http.ErrServerClosed {
-		return err
+		return errors.Join(err, stopErr)
 	}
-	return nil
+	return stopErr
 }
 
 func main() {
+	if handled, err := runTUNCommand(os.Args[1:]); handled {
+		if err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	core := flag.String("core", "", "Absolute path to trusted sing-box 1.12.12 (default: beside the executable)")
 	tokenFile := flag.String("token-file", "", "Existing private token file")
 	tun := flag.Bool("tun", false, "Allow TUN (requires network privileges)")
