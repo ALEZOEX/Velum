@@ -36,7 +36,8 @@ def check_info(info, path, owners, directory=False, private=False):
     if (not expected(info.st_mode) or info.st_uid not in owners
             or info.st_mode & (0o077 if private else 0o022)
             or (not directory and info.st_nlink != 1)):
-        raise InstallError(f'Untrusted owner, permissions, type or hard links: {path}')
+        raise InstallError(f'Untrusted owner, permissions, type or hard links: {path} '
+                           f'(uid={info.st_uid}, gid={info.st_gid}, mode={oct(info.st_mode)}, links={info.st_nlink})')
 
 
 def check_acl(fd, path):
@@ -51,7 +52,9 @@ def open_dir(path, owners=(0,), source=False):
         raise InstallError(f'Absolute path without .. required: {path}')
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
     try:
+        current = Path('/')
         for part in path.parts[1:]:
+            current = current / part
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -59,8 +62,8 @@ def open_dir(path, owners=(0,), source=False):
             # A sticky ancestor (e.g. /tmp) cannot replace an owned child.
             sticky = source and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
             if not sticky:
-                check_info(info, path, (0, *owners) if source else owners, directory=True)
-                check_acl(fd, path)
+                check_info(info, current, (0, *owners) if source else owners, directory=True)
+                check_acl(fd, current)
         return fd
     except BaseException:
         os.close(fd)

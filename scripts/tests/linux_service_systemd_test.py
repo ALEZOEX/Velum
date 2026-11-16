@@ -75,6 +75,8 @@ def main():
                 for command in (('route', 'show', 'table', 'all'), ('rule', 'show'))]
     network_before = network_snapshot()
     checks = []
+    prepared_parents = []
+    parent_metadata = []
     temporary = Path(tempfile.mkdtemp(prefix='velum-f15-systemd-'))
     os.chmod(temporary, 0o755)
     repo = temporary / 'reviewed-release'
@@ -113,6 +115,31 @@ def main():
         return {str(p): (hashlib.sha256(p.read_bytes()).hexdigest(), stat.S_IMODE(p.stat().st_mode))
                 for p in [*base.iterdir(), unit, config / 'token', policy]}
     try:
+        # Hosted runner images may make shared development directories writable
+        # by the runner account. Test refusal first; prepare trusted ancestors
+        # explicitly ONLY in this disposable VM, then restore their attributes.
+        parents = sorted({p for target in (base.parent, unit.parent, policy.parent, config.parent)
+                          for p in (target, *target.parents) if str(p) != '/'},
+                         key=lambda p: len(p.parts))
+        for parent in parents:
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError(f'VM fixture refuses non-directory ancestor: {parent}')
+            parent_metadata.append({'path': str(parent), 'uid': info.st_uid, 'gid': info.st_gid,
+                                    'mode': oct(stat.S_IMODE(info.st_mode))})
+        print('Hosted VM ancestor metadata: ' + json.dumps(parent_metadata), flush=True)
+        unsafe = [p for p in parents if p.stat().st_uid != 0 or p.stat().st_mode & 0o022]
+        if unsafe:
+            refusal = invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)
+            assert 'Untrusted' in refusal.stderr
+            assert not any(p.exists() for p in (base, unit, config, policy))
+            print('Expected refusal before fixture preparation: ' + refusal.stderr.strip(), flush=True)
+            checks.append('unsafe hosted-image ancestors refused before any service installation')
+        for parent in unsafe:
+            info = parent.stat()
+            prepared_parents.append((parent, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)))
+            os.chown(parent, 0, 0)
+            os.chmod(parent, stat.S_IMODE(info.st_mode) & ~0o022)
         install()
         status()
         assert run('/usr/bin/systemctl', 'is-active', 'velum.service').stdout.strip() == 'active'
@@ -167,8 +194,8 @@ def main():
         checks.append('symlink destination refuses install and uninstall; outside files unchanged')
         assert network_snapshot() == network_before
         checks.append('IPv4/IPv6 routes and policy rules unchanged; no connect requests sent')
-        print(json.dumps({'passed': True, 'checks': checks, 'vpnConnected': False}, indent=2))
-        Path(args.result).write_text(json.dumps({'passed': True, 'checks': checks, 'vpnConnected': False}, indent=2))
+        print(json.dumps({'passed': True, 'checks': checks, 'vpnConnected': False, 'hostedImageAncestors': parent_metadata}, indent=2))
+        Path(args.result).write_text(json.dumps({'passed': True, 'checks': checks, 'vpnConnected': False, 'hostedImageAncestors': parent_metadata}, indent=2))
     finally:
         # Use the reviewed production uninstaller. Never broaden cleanup if it
         # refuses an unsafe tree; hosted VM destruction is the final boundary.
@@ -178,6 +205,9 @@ def main():
                 print('Cleanup refused; retain VM diagnostics: ' + result.stderr)
         if not base.exists():
             shutil.rmtree(temporary)
+            for parent, old_uid, old_gid, old_mode in reversed(prepared_parents):
+                os.chown(parent, old_uid, old_gid)
+                os.chmod(parent, old_mode)
 
 
 if __name__ == '__main__':
