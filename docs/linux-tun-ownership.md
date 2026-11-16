@@ -101,8 +101,9 @@ if a stopped orphan core holds inherited log pipes.
 The generated unit adds `ExecStartPre` / `ExecStopPost` recovery and preserves
 private `RuntimeDirectory=velum velum-tun` across stop/restart, including forced
 termination. The service's read-only filesystem sandbox permits those runtime
-directories. **Actual systemd installation/cgroup kill was not executed in this
-task.** Existing installations require updating their unit through the installer;
+directories. **Actual unit hooks/cgroup kills were verified in a NIC-less Debian13 VM**,
+including independent Pre/Post recovery (see `linux-systemd-recovery.md`).
+Existing installations require updating their unit through the installer;
 binary replacement alone does not add hooks. Console mode has independent
 supervision plus next-start recovery, but no perpetual external watchdog if
 both processes are killed. A machine reboot removes this tmpfs state and the
@@ -142,11 +143,13 @@ foreign VPN sentinels at priorities9000/table2022 survive.
 Data-plane tests confirm IPv4/IPv6 TCP and UDP/TCP DNS interception via a local
 SOCKS fixture. A separate two-namespace test confirms actual Hysteria2, Reality +
 Vision and XHTTP bridge traffic, A/AAAA over proxy DoH, disconnect and SIGTERM.
-**That complete network suite fails its direct-CIDR egress assertion** (direct
-TCP timeout/reset). The same failure was reproduced on clean origin/main
-`0c2e2cdf0e6853dd2c33da5f235167c16c157278` with stock core. It is an existing
-routing limitation, not silently marked PASS or fixed outside this F2 change.
-The test continues through later protocols but still returns failure.
+The former direct-CIDR timeout was traced to strict reverse-path validation:
+the physical TCP reply was seen by tcpdump but its reverse lookup selected TUN.
+Source/destination/UID-scoped owned rules now preserve direct return paths;
+ordinary traffic still enters TUN for DNS/application policy. The full network
+suite passes, including overlaps, both IP families, excluded-address DNS hijack,
+missing physical defaults, precedence and complete post-disconnect snapshots.
+See `linux-direct-cidr.md` for packet evidence and the separate DAD fixture fix.
 
 Limits:
 
@@ -163,7 +166,7 @@ Limits:
    own rules behind. There is no unsafe heuristic recovery. Recovery errors,
    missing hooks, or a surviving stopped core can require operator action.
 4. Namespace proofs do not validate every kernel, policy precedence with Happ,
-   physical-network DNS leaks, Windows runtime, or a real systemd restart.
+   physical-network DNS leaks, Windows runtime, or systemd behavior beyond the tested Debian13 VM.
    Server address changes still require reconnect/resolution; automatic
    reconciliation of DNS endpoint changes is outside this patch.
 
@@ -177,9 +180,10 @@ Recorded development checks (Linux 7.3.1-1-cachyos, Go1.27.3 linux/amd64):
 | Linux/Windows amd64 daemon builds; Windows test cross-compilation | PASS; Windows runtime not run |
 | Ownership wrapper with `VELUM_F2_RACE=1` | PASS: all 17 isolated cases |
 | Pinned sing-box config checks (including Vision, Hysteria2, XHTTP bridge config) | PASS |
-| Complete two-namespace protocol suite | FAIL: pre-existing direct-CIDR egress; Hysteria2/Vision/XHTTP/DNS/shutdown passed |
+| Complete two-namespace protocol suite | PASS: direct CIDR + overlaps/unavailable routes, Hysteria2/Vision/XHTTP/DNS/shutdown |
 | Shell/Python syntax and Git whitespace checks | PASS |
-| Real installed systemd lifecycle / host TUN / desktop resolved | UNVERIFIED |
+| Real systemd unit lifecycle / cgroup kills / recovery | PASS: Debian13, systemd257.13, kernel6.12.117, eight scenarios |
+| Developer host TUN / desktop resolved / Windows runtime | UNVERIFIED |
 
 Flutter and Windows TUN implementation were not changed. No Flutter checks or
 Windows runtime were performed for this change. F15 installer path/rollback work
@@ -195,7 +199,7 @@ go test -race ./...
 go vet ./...
 cd ..
 VELUM_F2_RACE=1 scripts/test-linux-tun-ownership.sh
-python3 scripts/test-linux-network.py   # see known failing direct-CIDR case
+python3 scripts/test-linux-network.py
 ```
 
 Requires Python3, patch, Go, iproute2, unshare/mount, `/dev/net/tun` and enabled
