@@ -83,10 +83,6 @@ jobs:
   flutter-linux:
     name: Flutter / ${{ matrix.distro }}
     runs-on: ubuntu-latest
-    # Flutter's PATH entries are prepended by the action. Keep the container's
-    # system tools available independently of the Ubuntu host runner PATH.
-    env:
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -e -o pipefail {0}
@@ -120,6 +116,10 @@ jobs:
 
     container:
       image: ${{ matrix.container }}
+      # The runner appends image Config.Env PATH after action tool paths.
+      # A job-level PATH is overridden by that logic on images without PATH.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     steps:
       - uses: actions/checkout@v4

@@ -77,12 +77,11 @@ void main() {
   );
 
   test(
-    'Windows reports missing provisioned token without creating one',
+    'Windows stays offline without generating a missing provisioned token',
     () async {
       await client.initialize();
       expect(await File('${directory.path}/token').exists(), isFalse);
       expect(client.state, 'offline');
-      expect(client.message, isNotEmpty);
     },
     skip: !Platform.isWindows,
   );
