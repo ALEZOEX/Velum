@@ -12,6 +12,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.request
 
 
@@ -111,6 +112,15 @@ def main():
         assert data['state'] == 'disconnected' and data['serviceMode'] == 'systemd'
         assert data['tunAllowed'] is True and data['xrayAvailable'] is True
         return data
+    def wait_for_status():
+        # Type=simple signals process startup before the daemon binds its API.
+        # The GUI also waits for authenticated readiness after a control start.
+        for _ in range(50):
+            try:
+                return status()
+            except OSError:
+                time.sleep(.1)
+        return status()  # Keep the actual final error, never silently pass.
     def snapshot():
         return {str(p): (hashlib.sha256(p.read_bytes()).hexdigest(), stat.S_IMODE(p.stat().st_mode))
                 for p in [*base.iterdir(), unit, config / 'token', policy]}
@@ -155,6 +165,15 @@ def main():
             for name in os.listxattr(file):
                 if name in ('system.posix_acl_access', 'system.posix_acl_default'):
                     os.removexattr(file, name)
+        original_daemon = (repo / 'bin/velumd').read_bytes()
+        (repo / 'bin/velumd').write_text('#!/bin/bash\nexit 97\n')
+        failed_first = invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)
+        assert 'ROLLBACK INCOMPLETE' not in failed_first.stderr, failed_first.stderr
+        assert not any(p.exists() for p in (base, unit, config, policy))
+        assert not unit_files()
+        run('/usr/bin/systemctl', 'is-active', 'velum.service', success=False)
+        checks.append('failed first install removes files and enable links; retry remains possible')
+        (repo / 'bin/velumd').write_bytes(original_daemon)
         install()
         status()
         assert run('/usr/bin/systemctl', 'is-active', 'velum.service').stdout.strip() == 'active'
@@ -172,7 +191,8 @@ def main():
         before = snapshot()
         old_binary = (repo / 'bin/velumd').read_bytes()
         (repo / 'bin/velumd').write_text('#!/bin/bash\nexit 97\n')
-        invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)
+        failed_update = invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)
+        assert 'ROLLBACK INCOMPLETE' not in failed_update.stderr, failed_update.stderr
         assert snapshot() == before
         status()
         checks.append('failed daemon readiness restores files/token/policy and restarts previous service')
@@ -186,7 +206,7 @@ def main():
         invoke(base / 'velum-service-control', 'stop')
         run('/usr/bin/systemctl', 'is-active', 'velum.service', success=False)
         invoke(base / 'velum-service-control', 'start')
-        status()
+        wait_for_status()
         checks.append('installed control helper stop/start')
         os.chmod(base / 'velumd', 0o777)
         invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)

@@ -238,6 +238,16 @@ def systemctl(*args, check=True):
     return result.returncode == 0
 
 
+def verify_unit_fragment(old_unit):
+    result = subprocess.run(['/usr/bin/systemctl', 'show', '--value', '--property=FragmentPath', 'velum.service'],
+                            env=ENV, capture_output=True, text=True)
+    if result.returncode or result.stderr.strip():
+        raise InstallError(f'Cannot establish the loaded service unit: {result.stderr.strip()}')
+    fragment = result.stdout.strip()
+    if fragment and (fragment != str(UNIT) or old_unit is None):
+        raise InstallError(f'Refusing to replace/control a service loaded from an unowned unit: {fragment}')
+
+
 def layout(script):
     # Deliberately do not resolve symlinks or use cwd/HOME/PATH.
     folder = Path(script).parent
@@ -360,6 +370,7 @@ def transact(args, script):
         if args.action in ('start', 'stop', 'restart', 'status'):
             if old_tree is None or not old_unit or not old_token:
                 raise InstallError('Not a verified, complete Velum service installation')
+            verify_unit_fragment(old_unit)
             systemctl(args.action, 'velum.service', *(['--no-pager'] if args.action == 'status' else []))
             return
 
@@ -369,6 +380,7 @@ def transact(args, script):
                 return
             if old_tree is None or not old_unit:
                 raise InstallError('Incomplete installation: refusing automatic removal of unowned files')
+            verify_unit_fragment(old_unit)
             was_active = systemctl('is-active', '--quiet', 'velum.service', check=False)
             was_enabled = systemctl('is-enabled', '--quiet', 'velum.service', check=False)
             saved_name = '.velum-remove-' + secrets.token_hex(12)
@@ -397,6 +409,7 @@ def transact(args, script):
                     systemctl('daemon-reload')
                     systemctl('enable' if was_enabled else 'disable', 'velum.service')
                     if was_active:
+                        systemctl('reset-failed', 'velum.service')
                         systemctl('start', 'velum.service')
                         ready()
                 except BaseException as rollback_error:
@@ -442,6 +455,7 @@ def transact(args, script):
         token = token.strip()
         if not 32 <= len(token) <= 255 or any(c < 33 or c > 126 for c in token):
             raise InstallError('GUI token must contain 32..255 printable non-space bytes')
+        verify_unit_fragment(old_unit)
         was_active = systemctl('is-active', '--quiet', 'velum.service', check=False)
         was_enabled = systemctl('is-enabled', '--quiet', 'velum.service', check=False)
         if not args.no_start and not was_active:
@@ -470,7 +484,7 @@ def transact(args, script):
                                        'config_existed': config is not None, 'stage': str(stage.path),
                                        'binary_backup': str(parent.path / saved_name)})
             handles.append(recovery.directory)
-            if was_active:
+            if old_unit is not None:
                 systemctl('stop', 'velum.service')
             touched = True
             if old_tree is not None:
@@ -488,6 +502,7 @@ def transact(args, script):
             systemctl('daemon-reload')
             if not args.no_start:
                 systemctl('enable', 'velum.service')
+                systemctl('reset-failed', 'velum.service')
                 systemctl('start', 'velum.service')
                 ready()
         except BaseException as error:
@@ -496,6 +511,10 @@ def transact(args, script):
                 # Do not replace/delete files under a process we failed to stop.
                 try:
                     systemctl('stop', 'velum.service')
+                    # Remove enable links while the managed unit still exists;
+                    # disabling after deleting a first-install unit may fail.
+                    if not was_enabled and units.exists(UNIT.name):
+                        systemctl('disable', 'velum.service')
                     if published:
                         remove_tree(parent, BASE.name)
                     if moved_old:
@@ -507,8 +526,12 @@ def transact(args, script):
                     if config_created:
                         os.rmdir(CONFIG.name, dir_fd=config_parent.fd)
                     systemctl('daemon-reload')
-                    systemctl('enable' if was_enabled else 'disable', 'velum.service')
+                    if was_enabled:
+                        systemctl('enable', 'velum.service')
+                    elif old_unit is None:
+                        systemctl('reset-failed', 'velum.service', check=False)
                     if was_active:
+                        systemctl('reset-failed', 'velum.service')
                         systemctl('start', 'velum.service')
                         ready()
                 except BaseException as rollback_error:

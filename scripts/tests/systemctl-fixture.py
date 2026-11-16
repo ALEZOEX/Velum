@@ -36,7 +36,18 @@ action = args[0]
 failure = run / ('fail-' + action)
 if failure.exists():
     failure.unlink()
+    if action == 'start' and (run / 'limit-on-failure').exists():
+        (run / 'start-limit').touch()
     sys.exit('injected systemctl failure: ' + action)
+if action == 'reset-failed':
+    (run / 'start-limit').unlink(missing_ok=True)
+if action in ('start', 'restart') and (run / 'start-limit').exists():
+    sys.exit('injected systemd start-limit-hit')
+if action == 'show':
+    override = run / 'unit-fragment'
+    print(override.read_text().strip() if override.exists() else
+          ('/etc/systemd/system/velum.service' if Path('/etc/systemd/system/velum.service').exists() else ''))
+    sys.exit(0)
 if action == 'is-active':
     sys.exit(0 if (run / 'active').exists() else 3)
 if action == 'is-enabled':

@@ -275,7 +275,8 @@ class InstallerTest(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'second binary'):
                 installer.transact(args, str(self.repo / 'scripts/linux_service_installer.py'))
         self.assertEqual(before, self.snapshot())
-        self.assertEqual(calls, self.calls()[:-2])  # Only read-only state queries.
+        self.assertTrue(all(call[0] in ('show', 'is-active', 'is-enabled')
+                            for call in self.calls()[len(calls):]))
         self.assertTrue(Path('/run/active').exists())
         self.assertFalse(list(BASE.parent.glob('.velum-*')))
         self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
@@ -418,6 +419,35 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(backup.stat().st_uid, 0)
         self.assertFalse(Path('/run/active').exists())
         self.assertEqual(json.loads((backup / 'state.json').read_text())['active'], True)
+
+    def test_start_limit_after_failed_update_is_reset_before_restoring_service(self):
+        self.invoke()
+        before = self.snapshot()
+        Path('/run/limit-on-failure').touch()
+        Path('/run/fail-start').touch()
+        result = self.invoke(success=False)
+        self.assertNotIn('ROLLBACK INCOMPLETE', result.stderr)
+        self.assertEqual(before, self.snapshot())
+        self.assertTrue(Path('/run/active').exists())
+        self.assertFalse(Path('/run/start-limit').exists())
+        calls = self.calls()
+        last_start = max(i for i, call in enumerate(calls) if call[0] == 'start')
+        self.assertEqual(calls[last_start - 1], ['reset-failed', 'velum.service'])
+        self.assertFalse(list(Path('/etc').glob('.velum-recovery-*')))
+
+    def test_inactive_owned_unit_is_stopped_before_publishing_update(self):
+        self.invoke('--no-start')
+        previous_calls = len(self.calls())
+        self.invoke('--no-start')
+        self.assertIn(['stop', 'velum.service'], self.calls()[previous_calls:])
+        self.assertFalse(Path('/run/active').exists())
+
+    def test_loaded_vendor_unit_is_not_overwritten_or_stopped(self):
+        Path('/run/unit-fragment').write_text('/usr/lib/systemd/system/velum.service')
+        result = self.invoke(success=False)
+        self.assertIn('unowned unit', result.stderr)
+        self.assertEqual(self.snapshot(), {})
+        self.assertTrue(all(call[0] == 'show' for call in self.calls()))
 
     def test_legacy_installation_can_be_upgraded_without_manifest(self):
         self.invoke('--no-start')
