@@ -1,7 +1,7 @@
 # F1: Windows service installation boundary
 
 Status: implemented candidate, **not confirmed closed** until native NTFS and
-SCM behavior is validated on a suitable disposable Windows VM. Linux mocks,
+SCM behavior and standard-user access are validated on a suitable disposable Windows VM. Linux mocks,
 Windows cross-compilation, Wine and in-memory descriptor tests are insufficient
 for that conclusion. No Windows service installation was performed during the
 Linux development session.
@@ -138,9 +138,34 @@ validation and amd64 FILE_RENAME_INFORMATION layout. Standard Windows CI runs
 these without service installation. A separate opt-in test exercises real NTFS
 creation, owner/DACL readback, reuse, failed-write cleanup, no-replace publication
 and rejection of a writable executable. It never registers/starts a service.
-The dedicated hosted Windows CI job also invokes this opt-in fixture through the
-VM-checking script on its disposable runner. Passing fixtures does not replace
-the separate SCM and standard-user negative matrix below.
+The dedicated hosted Windows CI job preserves this opt-in fixture through the
+VM-checking script on its disposable runner. It additionally runs
+`test-windows-service-scm.ps1 -DisposableVM` with the actual daemon and the
+repository's version-only `testdata/f1-core` fixture. This exercises production
+SCM install/start/stop/restart/uninstall, not a substitute service executable.
+The core fixture has no network implementation and rejects every non-version
+command. The daemon stays disconnected; only GET /v1/status is requested.
+
+The SCM script requires a clean recognized VM and elevation, refuses existing
+Velum objects, creates a temporary standard local account, and probes real NTFS
+access using LogonUser/WindowsIdentity.RunImpersonated. Positive controls prove
+that the account can open an explicitly permitted test file. Installed tree
+owner, complete protected DACL and inheritance flags are read back. Write,
+append, attributes/EA, delete, directory delete-child, ACL and owner access must
+return ERROR_ACCESS_DENIED, with the service stopped and installer handles
+released. A sharing violation is a failure, not an ACL success. The unrelated
+account must also be unable to read the Bearer token. Content hashes and SDDL
+must remain unchanged after probes. Missing Bearer authentication must return
+HTTP 401; the authorized idle status must report no running engine/TUN.
+
+Negative runtime cases cover extra write ACEs on the root, token and executable,
+unsafe uninstall and a bin junction to an outside sentinel. Refusal must preserve
+the fixture and leave SCM absent (or unchanged for unsafe uninstall). A corrected
+fixture must allow a safe retry. Production uninstall retains protected token/root;
+the harness then removes only its own known test resources, with no recursive
+traversal. The job uploads a JSON list of completed checks. This is an automated
+subset of the full matrix below, not a claim that every negative case or Windows
+11 desktop behavior has been exercised.
 
 ## Disposable Windows 11 VM procedure
 
@@ -172,8 +197,10 @@ for inspection. Preserve output and descriptors, then revert the snapshot.
 
 ### Separate SCM end-to-end matrix (requires explicit VM installation approval)
 
-This part is **not run by the script or standard CI**. Before any service
-installation, obtain permission for this exact disposable VM. Use a trusted
+The SCM script now automates the subset described above in the authorized
+disposable hosted runner. The remaining rows below require a separate clean VM
+snapshot for each adversarial fixture. Before running them elsewhere, obtain
+permission for that exact disposable VM. Use a trusted
 staged package with velumd/sing-box/optional Xray; record its hashes. Never send
 connect requests. Invoke `velumd.exe --service install` **without --tun** for
 these installation-only checks. No network engine connection is necessary.

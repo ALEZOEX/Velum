@@ -46,6 +46,21 @@ jobs:
           go test -c -o "$env:RUNNER_TEMP\velum-f1.test.exe" .
           if ($LASTEXITCODE -ne 0) { throw 'Windows fixture test compilation failed.' }
           & ..\scripts\test-windows-service-acl.ps1 -TestBinary "$env:RUNNER_TEMP\velum-f1.test.exe" -DisposableVM
+      - name: Real SCM and standard-user ACL checks in disposable hosted VM
+        working-directory: daemon
+        shell: pwsh
+        run: |
+          go build -o "$env:RUNNER_TEMP\velum-f1-daemon.exe" .
+          if ($LASTEXITCODE -ne 0) { throw 'Daemon compilation failed.' }
+          go build -o "$env:RUNNER_TEMP\velum-f1-core.exe" ./testdata/f1-core
+          if ($LASTEXITCODE -ne 0) { throw 'Inert core fixture compilation failed.' }
+          & ..\scripts\test-windows-service-scm.ps1 -DaemonBinary "$env:RUNNER_TEMP\velum-f1-daemon.exe" -CoreFixture "$env:RUNNER_TEMP\velum-f1-core.exe" -DisposableVM
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-service-scm-results
+          path: ${{ runner.temp }}/velum-f1-scm-results.json
+          if-no-files-found: warn
 
   flutter-windows:
     name: Flutter / Windows
