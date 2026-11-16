@@ -8,6 +8,7 @@ import 'package:velum/network_mode_control.dart';
 
 class ModeClient extends VelumClient {
   ModeClient() : super(directory: Directory.systemTemp);
+  int serviceChecks = 0;
   @override
   Future<void> saveSettings(Map<String, dynamic> value) async {
     settings.addAll(value);
@@ -15,8 +16,10 @@ class ModeClient extends VelumClient {
   }
 
   @override
-  Future<LinuxServiceState> checkLinuxServiceState() async =>
-      LinuxServiceState.notInstalled;
+  Future<LinuxServiceState> checkLinuxServiceState() async {
+    serviceChecks++;
+    return LinuxServiceState.notInstalled;
+  }
 }
 
 void main() {
@@ -127,7 +130,10 @@ void main() {
     await tester.tap(find.text('Как включить VPN для всей системы'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
-    expect(find.textContaining('службой'), findsWidgets);
+    expect(client.serviceChecks, 1);
+    expect(find.text('Управление службой Linux'), findsOneWidget);
+    expect(find.text('Служба не установлена'), findsOneWidget);
+    expect(find.text('Установить службу'), findsOneWidget);
     expect(find.text('Закрыть'), findsOneWidget);
     await tester.tap(find.text('Закрыть'));
     await tester.pump();
@@ -135,5 +141,5 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
     client.dispose();
-  });
+  }, skip: !Platform.isLinux);
 }
