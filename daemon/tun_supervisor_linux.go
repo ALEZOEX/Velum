@@ -217,6 +217,16 @@ func superviseTUN(core, path string) (result error) {
 	if e != nil {
 		return e
 	}
+	sources, e := tunUplinkSources(iface)
+	if e != nil {
+		return e
+	}
+	directRules, e := tunDirectReturnRules(cfg, sources, journal.Mark)
+	if e != nil {
+		return e
+	}
+	// These disjoint source-scoped rules precede the ordinary TUN selectors.
+	journal.Objects = append(directRules, journal.Objects...)
 	if e = lease.install(journal, tunMutate); e != nil {
 		return e
 	}

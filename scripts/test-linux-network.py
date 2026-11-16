@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real daemon and Hysteria2 in disposable Linux network namespaces."""
 import base64
+import contextlib
 import http.server
 import ipaddress
 import json
@@ -55,6 +56,67 @@ def wait_for(check, process=None):
     raise TimeoutError('Timed out waiting for test service')
 
 
+def routing_snapshot():
+    result=[]
+    for version in ['-4', '-6']:
+        for kind in ['rule', 'route']:
+            args=['ip', '-j', '-N', version, kind, 'show']
+            if kind == 'route': args+=['table', 'all']
+            result += [version+kind+json.dumps(x, sort_keys=True) for x in json.loads(run(*args))]
+    return sorted(result)
+
+
+def reverse_path_drops():
+    rows=Path('/proc/net/netstat').read_text().splitlines()
+    for names, values in zip(rows[::2], rows[1::2]):
+        names, values=names.split(), values.split()
+        if 'IPReversePathFilter' in names:
+            return int(values[names.index('IPReversePathFilter')])
+    raise RuntimeError('Kernel lacks reverse path diagnostic counter')
+
+
+def read_exact(sock, count):
+    data=b''
+    while len(data)<count:
+        part=sock.recv(count-len(data))
+        if not part: raise EOFError('Short DNS response')
+        data+=part
+    return data
+
+
+def http_proof(address, path, timeout=5):
+    host=f'[{address}]' if ':' in address else address
+    with HTTP.open(f'http://{host}:8080/{path}', timeout=timeout) as response:
+        return json.load(response)
+
+
+def record_routing(peer_pid, label):
+    print('DIAG', label, json.dumps(routing_snapshot()), flush=True)
+    for version, target, source in [('-4', '198.19.0.2', '198.18.0.1'), ('-6', 'fd00:19::2', 'fd00:18::1')]:
+        for extra in [[], ['oif', 'lab0'], ['from', source]]:
+            print('DIAG client route', version, extra, run('ip', version, 'route', 'get', target, *extra), flush=True)
+        print('DIAG server return', source, run('nsenter', '-t', str(peer_pid), '-n', '--', 'ip', version, 'route', 'get', source), flush=True)
+
+
+@contextlib.contextmanager
+def capture_packets(folder, peer_pid):
+    captures=[]
+    try:
+        for name, prefix in [('client', []), ('peer', ['nsenter', '-t', str(peer_pid), '-n', '--'])]:
+            path=folder/(name+'-packets.log')
+            with path.open('w') as f:
+                process=subprocess.Popen(prefix+['tcpdump', '-l', '-n', '-tt', '-i', 'any', 'tcp port 8080'], stdout=f, stderr=subprocess.STDOUT)
+            captures.append((name, process, path))
+        time.sleep(.2)
+        for _, process, _ in captures:
+            if process.poll() is not None: raise RuntimeError('Packet capture failed')
+        yield
+    finally:
+        for name, process, path in captures:
+            stop(process)
+            print('DIAG packets', name, path.read_text(), flush=True)
+
+
 class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         data = json.dumps({'peer': self.client_address[0], 'path': self.path}).encode()
@@ -102,7 +164,7 @@ def peer(folder):
     try:
         class IPv6Server(http.server.ThreadingHTTPServer):
             address_family = socket.AF_INET6
-        for cls, address in [(http.server.ThreadingHTTPServer, ('198.19.0.2', 8080)), (IPv6Server, ('fd00:19::2', 8080))]:
+        for cls, address in [(http.server.ThreadingHTTPServer, (ip, 8080)) for ip in ['198.19.0.2', '198.20.0.2']] + [(IPv6Server, (ip, 8080)) for ip in ['fd00:19::2', 'fd00:20::2']]:
             server = cls(address, Origin)
             servers.append(server)
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -178,14 +240,22 @@ def isolated():
                 return run('nsenter', '-t', str(peer_process.pid), '-n', '--', *args)
             for command in [('ip', 'link', 'set', 'lo', 'up'), ('ip', 'link', 'set', 'lab1', 'up'), ('ip', 'addr', 'add', '198.18.0.2/24', 'dev', 'lab1'), ('ip', 'addr', 'add', '198.19.0.2/32', 'dev', 'lo'), ('ip', 'addr', 'add', '1.1.1.1/32', 'dev', 'lo'), ('ip', '-6', 'addr', 'add', 'fd00:18::2/64', 'dev', 'lab1', 'nodad'), ('ip', '-6', 'addr', 'add', 'fd00:19::2/128', 'dev', 'lo', 'nodad')]:
                 remote(*command)
+            remote('ip', 'addr', 'add', '198.20.0.2/32', 'dev', 'lo')
+            remote('ip', '-6', 'addr', 'add', 'fd00:20::2/128', 'dev', 'lo', 'nodad')
             run('ip', 'link', 'set', 'lab0', 'up')
+            for n in ['all', 'lab0']:
+                Path('/proc/sys/net/ipv4/conf/' + n + '/rp_filter').write_text('1')
             run('ip', 'addr', 'add', '198.18.0.1/24', 'dev', 'lab0')
             run('ip', '-6', 'addr', 'add', 'fd00:18::1/64', 'dev', 'lab0', 'nodad')
             run('ip', 'route', 'add', 'default', 'via', '198.18.0.2')
             run('ip', '-6', 'route', 'add', 'default', 'via', 'fd00:18::2')
             (folder / 'network-ready').touch()
             wait_for(lambda: (folder / 'peer-ready').exists(), peer_process)
-            baseline = {version: run('ip', version, 'rule') for version in ('-4', '-6')}
+            # Auto-created IPv6 link-local addresses finish DAD asynchronously.
+            # Snapshot only stable fixture state; do not mistake kernel DAD for a TUN leak.
+            wait_for(lambda: 'tentative' not in run('ip', '-6', 'addr', 'show', 'dev', 'lab0'))
+            wait_for(lambda: 'tentative' not in remote('ip', '-6', 'addr', 'show', 'dev', 'lab1'))
+            baseline = routing_snapshot()
             token = secrets.token_hex(32)
             token_path = folder / 'token'
             token_path.write_text(token)
@@ -219,21 +289,76 @@ def isolated():
                 print(f'PASS TUN DNS type {qtype}: hijack -> proxy DoH -> {address}', flush=True)
             assert api('disconnect', {})['state'] == 'disconnected'
             wait_for(lambda: 'velum0' not in run('ip', '-j', 'link'))
-            for version in ('-4', '-6'):
-                assert run('ip', version, 'rule') == baseline[version], 'Policy rules not restored'
+            assert routing_snapshot() == baseline, 'Policy rules/routes not restored: extra=' + str(set(routing_snapshot())-set(baseline)) + '; missing=' + str(set(baseline)-set(routing_snapshot()))
             print('PASS disconnect: TUN removed, IPv4/IPv6 policy rules restored', flush=True)
-            assert api('connect', {'uri': 'hy2://velum-local-test@198.18.0.2:8443?sni=localhost', 'exclusions': ['198.19.0.0/24']})['state'] == 'running'
-            failures = []
-            try:
-                with HTTP.open('http://198.19.0.2:8080/direct', timeout=8) as response:
-                    assert json.load(response)['peer'] == '198.18.0.1'
-                print('PASS CIDR exclusion: direct egress verified', flush=True)
-            except (OSError, AssertionError) as error:
-                failures.append(f'CIDR direct egress: {error}')
-                print(f'FAIL {failures[-1]}', flush=True)
-            # Exercise the remaining transports too; accumulated errors still fail the suite.
+            assert api('connect', {'uri': 'hy2://velum-local-test@198.18.0.2:8443?sni=localhost', 'exclusions': ['198.19.0.0/24', '198.19.0.0/25', '198.19.0.2/32', 'fd00:19::/64', 'fd00:19::/96', 'fd00:19::2/128']})['state'] == 'running'
+            print('DIAG strict rp_filter:', {n: Path('/proc/sys/net/ipv4/conf/' + n + '/rp_filter').read_text().strip() for n in ['all', 'lab0']}, flush=True)
+            before_rpf = reverse_path_drops()
+            record_routing(peer_process.pid, 'direct CIDR active')
+            with capture_packets(folder, peer_process.pid):
+                for address, expected in [('198.19.0.2', '198.18.0.1'), ('fd00:19::2', 'fd00:18::1')]:
+                    proof = http_proof(address, 'direct')
+                    assert proof['peer'] == expected, proof
+                    print(f'PASS CIDR direct {address}: physical egress {expected}', flush=True)
+            assert reverse_path_drops() == before_rpf, 'Strict reverse-path validation dropped direct replies'
+            for address in ['198.20.0.2', 'fd00:20::2']:
+                proof = http_proof(address, 'nonexcluded')
+                assert proof['peer'] == address, proof
+                print(f'PASS nonexcluded {address}: VPN egress', flush=True)
+            # Even DNS addresses inside excluded CIDRs must retain hijack precedence.
+            for family, dns_host in [(socket.AF_INET, '198.19.0.53'), (socket.AF_INET6, 'fd00:19::53')]:
+                for stream in [False, True]:
+                    query = b'DR' + struct.pack('!HHHHH', 0x100, 1, 0, 0, 0) + b'\x06origin\x05velum\x04test\0' + struct.pack('!HH', 1, 1)
+                    with socket.socket(family, socket.SOCK_STREAM if stream else socket.SOCK_DGRAM) as dns:
+                        dns.settimeout(5)
+                        dns.connect((dns_host, 53))
+                        dns.sendall(struct.pack('!H', len(query)) + query if stream else query)
+                        if stream:
+                            n = struct.unpack('!H', read_exact(dns, 2))[0]
+                            answer = read_exact(dns, n)
+                        else:
+                            answer = dns.recv(4096)
+                    assert answer[:2] == b'DR' and ipaddress.ip_address('198.19.0.2').packed in answer, answer.hex()
+                    print(f'PASS excluded DNS {dns_host} {"TCP" if stream else "UDP"}: hijack retained', flush=True)
+            # Removing only our fixture's physical defaults must fail direct, never loop/fallback to VPN.
+            for version, gateway, target, source in [('-4', '198.18.0.2', '198.19.0.2', '198.18.0.1'), ('-6', 'fd00:18::2', 'fd00:19::2', 'fd00:18::1')]:
+                run('ip', version, 'route', 'del', 'default', 'via', gateway, 'dev', 'lab0')
+                try:
+                    route = subprocess.run(['ip', version, 'route', 'get', target, 'from', source], capture_output=True, text=True)
+                    assert route.returncode != 0 and 'unreachable' in route.stderr.lower(), route
+                    started = time.monotonic()
+                    with capture_packets(folder, peer_process.pid):
+                        try:
+                            http_proof(target, 'unreachable', timeout=8)
+                        except TimeoutError:
+                            raise AssertionError('Core did not report direct route failure')
+                        except OSError:
+                            pass
+                        else:
+                            raise AssertionError('Missing direct route fell back to proxy')
+                    assert time.monotonic() - started < 7, 'Direct route failure exceeded bounded core dial timeout'
+                    proof = http_proof('198.20.0.2' if version == '-4' else 'fd00:20::2', 'still-vpn')
+                    assert proof['peer'] in ['198.20.0.2', 'fd00:20::2'], proof
+                    print(f'PASS unavailable direct route {version}: bounded failure, VPN retained', flush=True)
+                finally:
+                    run('ip', version, 'route', 'add', 'default', 'via', gateway, 'dev', 'lab0')
             assert api('disconnect', {})['state'] == 'disconnected'
             wait_for(lambda: 'velum0' not in run('ip', '-j', 'link'))
+            assert routing_snapshot() == baseline, 'extra=' + str(set(routing_snapshot())-set(baseline)) + '; missing=' + str(set(baseline)-set(routing_snapshot()))
+            assert api('connect', {'uri': 'hy2://velum-local-test@198.18.0.2:8443?sni=localhost',
+                'exclusions': ['198.19.0.0/24', 'fd00:19::/64'], 'settings': {'routeMode': 'rules', 'rules': [
+                    {'action': 'block', 'type': 'cidr', 'value': '198.19.0.2/32'},
+                    {'action': 'block', 'type': 'cidr', 'value': 'fd00:19::2/128'}]}})['state'] == 'running'
+            for address in ['198.19.0.2', 'fd00:19::2']:
+                try:
+                    http_proof(address, 'must-block', timeout=3)
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError('Kernel direct rules bypassed higher-priority block')
+            print('PASS block rules retain precedence over CIDR exclusions', flush=True)
+            assert api('disconnect', {})['state'] == 'disconnected'
+            assert routing_snapshot() == baseline, 'extra=' + str(set(routing_snapshot())-set(baseline)) + '; missing=' + str(set(baseline)-set(routing_snapshot()))
             vless = f'vless://00000000-0000-4000-8000-000000000001@198.18.0.2:8444?security=reality&type=tcp&sni=localhost&pbk={public}&sid=abcd&flow=xtls-rprx-vision'
             assert api('connect', {'uri': vless})['state'] == 'running'
             with HTTP.open('http://198.19.0.2:8080/vless', timeout=8) as response:
@@ -253,11 +378,8 @@ def isolated():
             daemon.terminate()
             daemon.wait(timeout=10)
             wait_for(lambda: 'velum0' not in run('ip', '-j', 'link'))
-            for version in ('-4', '-6'):
-                assert run('ip', version, 'rule') == baseline[version]
+            assert routing_snapshot() == baseline, 'Policy rules/routes not restored: extra=' + str(set(routing_snapshot())-set(baseline)) + '; missing=' + str(set(baseline)-set(routing_snapshot()))
             print('PASS SIGTERM: child stopped, TUN and policy rules removed', flush=True)
-            if failures:
-                raise RuntimeError('; '.join(failures))
         except Exception:
             try:
                 print('Core diagnostic entries:', json.dumps(api('logs')), file=sys.stderr)

@@ -18,6 +18,7 @@ import (
 )
 
 const tunStateRoot = "/run/velum-tun"
+const tunMaxObjects = 2048
 
 type tunJournal struct {
 	Version   int
@@ -135,6 +136,9 @@ func (l *tunLease) write(j *tunJournal) error {
 	if e != nil {
 		return e
 	}
+	if len(b) >= 1024*1024 {
+		return errors.New("TUN journal plan exceeds 1 MiB; setup refused")
+	}
 	b = append(b, '\n')
 	var random [12]byte
 	if _, e = rand.Read(random[:]); e != nil {
@@ -196,7 +200,7 @@ func decodeTUNJournal(data []byte, namespace, boot string) (*tunJournal, error) 
 	if _, e = hex.DecodeString(j.Session); e != nil {
 		return nil, errors.New("invalid TUN session identifier")
 	}
-	if j.Version != 1 || j.Boot == "" || j.Boot != boot || j.Namespace != namespace || len(j.Session) != 32 || j.Mark < 65536 || j.Mark > 0x7fffffff || j.Attempt < 0 || j.Attempt > len(j.Objects) || len(j.Objects) > 256 || j.Hash != tunPlanHash(j.Objects) {
+	if j.Version != 1 || j.Boot == "" || j.Boot != boot || j.Namespace != namespace || len(j.Session) != 32 || j.Mark < 65536 || j.Mark > 0x7fffffff || j.Attempt < 0 || j.Attempt > len(j.Objects) || len(j.Objects) > tunMaxObjects || j.Hash != tunPlanHash(j.Objects) {
 		return nil, errors.New("invalid TUN journal identity/plan; automatic recovery refused")
 	}
 	for _, o := range j.Objects {
@@ -417,7 +421,7 @@ func createOwnedTUN(in map[string]any, j *tunJournal) (*os.File, int, error) {
 	return f, link.Attrs().Index, nil
 }
 func (l *tunLease) install(j *tunJournal, mutate func(tunObject, bool) error) error {
-	if len(j.Objects) > 256 {
+	if len(j.Objects) > tunMaxObjects {
 		return errors.New("TUN plan too large")
 	}
 	j.Hash = tunPlanHash(j.Objects)

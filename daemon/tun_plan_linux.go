@@ -102,7 +102,7 @@ func tunPlan(in map[string]any, index int, mark uint32) ([]tunObject, error) {
 				addresses = append(addresses, p)
 			}
 		}
-		p := linuxTUNRuleStart
+		p := linuxTUNRuleStart + 1 // First slot is reserved for physically sourced direct return paths.
 		nop := linuxTUNRuleEnd
 		if len(addresses) == 0 {
 			objects = append(objects, tunRule(family, p, 0, unix.FR_ACT_UNREACHABLE, mark))
