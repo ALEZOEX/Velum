@@ -20,8 +20,8 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
-CORE = ROOT / 'bin/sing-box'
-DAEMON = ROOT / 'bin/velumd'
+CORE = Path(os.environ.get('VELUM_TEST_CORE', ROOT / 'bin/sing-box'))
+DAEMON = Path(os.environ.get('VELUM_TEST_DAEMON', ROOT / 'bin/velumd'))
 XRAY = ROOT / 'bin/xray'
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -154,6 +154,10 @@ def peer(folder):
 
 def isolated():
     assert os.geteuid() == 0, 'Run through user namespace wrapper'
+    assert os.readlink('/proc/self/ns/net') != os.environ['VELUM_NETWORK_HOST_NETNS']
+    assert os.readlink('/proc/self/ns/mnt') != os.environ['VELUM_NETWORK_HOST_MNTNS']
+    run('mount', '--make-rprivate', '/')
+    run('mount', '-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', '/run')
     assert {link['ifname'] for link in json.loads(run('ip', '-j', 'link'))} == {'lo'}, 'Refusing to change a nonempty network namespace'
     with tempfile.TemporaryDirectory(prefix='velum-network-') as tmp:
         folder = Path(tmp)
@@ -219,9 +223,15 @@ def isolated():
                 assert run('ip', version, 'rule') == baseline[version], 'Policy rules not restored'
             print('PASS disconnect: TUN removed, IPv4/IPv6 policy rules restored', flush=True)
             assert api('connect', {'uri': 'hy2://velum-local-test@198.18.0.2:8443?sni=localhost', 'exclusions': ['198.19.0.0/24']})['state'] == 'running'
-            with HTTP.open('http://198.19.0.2:8080/direct', timeout=8) as response:
-                assert json.load(response)['peer'] == '198.18.0.1'
-            print('PASS CIDR exclusion: direct egress verified', flush=True)
+            failures = []
+            try:
+                with HTTP.open('http://198.19.0.2:8080/direct', timeout=8) as response:
+                    assert json.load(response)['peer'] == '198.18.0.1'
+                print('PASS CIDR exclusion: direct egress verified', flush=True)
+            except (OSError, AssertionError) as error:
+                failures.append(f'CIDR direct egress: {error}')
+                print(f'FAIL {failures[-1]}', flush=True)
+            # Exercise the remaining transports too; accumulated errors still fail the suite.
             assert api('disconnect', {})['state'] == 'disconnected'
             wait_for(lambda: 'velum0' not in run('ip', '-j', 'link'))
             vless = f'vless://00000000-0000-4000-8000-000000000001@198.18.0.2:8444?security=reality&type=tcp&sni=localhost&pbk={public}&sid=abcd&flow=xtls-rprx-vision'
@@ -246,6 +256,8 @@ def isolated():
             for version in ('-4', '-6'):
                 assert run('ip', version, 'rule') == baseline[version]
             print('PASS SIGTERM: child stopped, TUN and policy rules removed', flush=True)
+            if failures:
+                raise RuntimeError('; '.join(failures))
         except Exception:
             try:
                 print('Core diagnostic entries:', json.dumps(api('logs')), file=sys.stderr)
@@ -280,4 +292,6 @@ if __name__ == '__main__':
             raise SystemExit('Build the pinned Xray companion first: make xray')
         if sys.platform != 'linux':
             raise SystemExit('This test requires Linux')
-        subprocess.run(['unshare', '--user', '--map-root-user', '--net', sys.executable, str(Path(__file__).resolve()), '--isolated'], check=True, timeout=90)
+        os.environ['VELUM_NETWORK_HOST_NETNS'] = os.readlink('/proc/self/ns/net')
+        os.environ['VELUM_NETWORK_HOST_MNTNS'] = os.readlink('/proc/self/ns/mnt')
+        subprocess.run(['unshare', '--user', '--map-root-user', '--mount', '--net', '--pid', '--fork', '--mount-proc', '--kill-child=KILL', sys.executable, str(Path(__file__).resolve()), '--isolated'], check=True, timeout=90)

@@ -172,12 +172,16 @@ ConditionPathExists=/dev/net/tun
 Type=simple
 User=root
 Group=root
+ExecStartPre=/usr/local/lib/velum/velumd --recover-tun
+ExecStopPost=/usr/local/lib/velum/velumd --recover-tun
 ExecStart=/usr/local/lib/velum/velumd --tun --core /usr/local/lib/velum/sing-box --token-file /etc/velum/token$xray_arg$interface_arg
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=12
 KillMode=control-group
-RuntimeDirectory=velum
+RuntimeDirectory=velum velum-tun
+# Preserve the ownership journal across service SIGKILL/restart.
+RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0700
 Environment=TMPDIR=/run/velum
 UMask=0077
