@@ -125,21 +125,36 @@ def main():
             info = parent.lstat()
             if not stat.S_ISDIR(info.st_mode):
                 raise RuntimeError(f'VM fixture refuses non-directory ancestor: {parent}')
+            acl_names = [name for name in os.listxattr(parent)
+                         if name in ('system.posix_acl_access', 'system.posix_acl_default')]
             parent_metadata.append({'path': str(parent), 'uid': info.st_uid, 'gid': info.st_gid,
-                                    'mode': oct(stat.S_IMODE(info.st_mode))})
+                                    'mode': oct(stat.S_IMODE(info.st_mode)), 'aclNames': acl_names})
         print('Hosted VM ancestor metadata: ' + json.dumps(parent_metadata), flush=True)
-        unsafe = [p for p in parents if p.stat().st_uid != 0 or p.stat().st_mode & 0o022]
+        unsafe = [p for p in parents if p.stat().st_uid != 0 or p.stat().st_mode & 0o022
+                  or any(n in os.listxattr(p) for n in ('system.posix_acl_access', 'system.posix_acl_default'))]
         if unsafe:
             refusal = invoke(installer, '--user', str(uid), '--token-file', str(token_file), success=False)
-            assert 'Untrusted' in refusal.stderr
+            assert 'Untrusted' in refusal.stderr or 'Extended ACL' in refusal.stderr
             assert not any(p.exists() for p in (base, unit, config, policy))
             print('Expected refusal before fixture preparation: ' + refusal.stderr.strip(), flush=True)
             checks.append('unsafe hosted-image ancestors refused before any service installation')
         for parent in unsafe:
             info = parent.stat()
-            prepared_parents.append((parent, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)))
+            acl = {name: os.getxattr(parent, name) for name in os.listxattr(parent)
+                   if name in ('system.posix_acl_access', 'system.posix_acl_default')}
+            prepared_parents.append((parent, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), acl))
+            for name in acl:
+                os.removexattr(parent, name)
             os.chown(parent, 0, 0)
             os.chmod(parent, stat.S_IMODE(info.st_mode) & ~0o022)
+        # Only our disposable input bundle: remove inherited/copied ACLs so the
+        # positive fixture meets the installer's documented trust preconditions.
+        for file in (temporary, *temporary.rglob('*')):
+            if file.is_symlink():
+                raise RuntimeError(f'Unexpected link in generated fixture: {file}')
+            for name in os.listxattr(file):
+                if name in ('system.posix_acl_access', 'system.posix_acl_default'):
+                    os.removexattr(file, name)
         install()
         status()
         assert run('/usr/bin/systemctl', 'is-active', 'velum.service').stdout.strip() == 'active'
@@ -205,9 +220,14 @@ def main():
                 print('Cleanup refused; retain VM diagnostics: ' + result.stderr)
         if not base.exists():
             shutil.rmtree(temporary)
-            for parent, old_uid, old_gid, old_mode in reversed(prepared_parents):
+            for parent, old_uid, old_gid, old_mode, old_acl in reversed(prepared_parents):
                 os.chown(parent, old_uid, old_gid)
                 os.chmod(parent, old_mode)
+                for name, value in old_acl.items():
+                    os.setxattr(parent, name, value)
+                restored = parent.stat()
+                assert (restored.st_uid, restored.st_gid, stat.S_IMODE(restored.st_mode)) == (old_uid, old_gid, old_mode)
+                assert all(os.getxattr(parent, name) == value for name, value in old_acl.items())
 
 
 if __name__ == '__main__':

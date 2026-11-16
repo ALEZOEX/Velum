@@ -316,15 +316,32 @@ class InstallerTest(unittest.TestCase):
     def test_extended_acl_rejected_without_repair(self):
         self.invoke('--no-start')
         import struct
-        # POSIX ACL: owner rwx, named GUI rwx, group r-x, mask rwx, other r-x.
+        # Read-only named ACE keeps mode 0755: exercise the ACL check itself.
+        acl = struct.pack('<I', 2)
+        for tag, perm, uid in ((1, 7, 0xffffffff), (2, 5, 1000), (4, 5, 0xffffffff),
+                               (16, 5, 0xffffffff), (32, 5, 0xffffffff)):
+            acl += struct.pack('<HHI', tag, perm, uid)
+        os.setxattr(BASE / 'velumd', 'system.posix_acl_access', acl)
+        before = os.getxattr(BASE / 'velumd', 'system.posix_acl_access')
+        self.assertEqual(stat.S_IMODE((BASE / 'velumd').stat().st_mode), 0o755)
+        result = self.invoke(success=False)
+        self.assertIn('Extended ACL', result.stderr)
+        self.assertEqual(os.getxattr(BASE / 'velumd', 'system.posix_acl_access'), before)
+
+    def test_default_directory_acl_is_refused_before_service_changes(self):
+        self.invoke('--no-start')
+        import struct
         acl = struct.pack('<I', 2)
         for tag, perm, uid in ((1, 7, 0xffffffff), (2, 7, 1000), (4, 5, 0xffffffff),
                                (16, 7, 0xffffffff), (32, 5, 0xffffffff)):
             acl += struct.pack('<HHI', tag, perm, uid)
-        os.setxattr(BASE / 'velumd', 'system.posix_acl_access', acl)
-        before = os.getxattr(BASE / 'velumd', 'system.posix_acl_access')
-        self.invoke(success=False)
-        self.assertEqual(os.getxattr(BASE / 'velumd', 'system.posix_acl_access'), before)
+        os.setxattr(BASE, 'system.posix_acl_default', acl)
+        calls = self.calls()
+        self.assertEqual(stat.S_IMODE(BASE.stat().st_mode), 0o755)
+        result = self.invoke(success=False)
+        self.assertIn('Extended ACL', result.stderr)
+        self.assertEqual(os.getxattr(BASE, 'system.posix_acl_default'), acl)
+        self.assertEqual(self.calls(), calls)
 
     def test_installed_token_hardlink_is_rejected_without_touching_outside(self):
         self.invoke('--no-start')
