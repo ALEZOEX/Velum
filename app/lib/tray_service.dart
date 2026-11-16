@@ -178,15 +178,27 @@ class VelumTrayService with tm.TrayListener {
     this.trayAdapter = const RealTrayManagerAdapter(),
     this.windowAdapter = const MethodChannelWindowAdapter(),
     this.exitInteraction,
-  });
+    bool? watchTray,
+    this.trayPollInterval = const Duration(seconds: 1),
+    this.scheduleTrayCheck = Timer.new,
+  }) : watchTray = watchTray ?? Platform.isLinux;
 
   final VelumClient client;
   final TrayManagerAdapter trayAdapter;
   final WindowActionAdapter windowAdapter;
+  final bool watchTray;
+  final Duration trayPollInterval;
+  final Timer Function(Duration, void Function()) scheduleTrayCheck;
   ExitInteraction? exitInteraction;
   Future<void>? _closeRequest;
   Future<void>? _trayDestruction;
   Future<void> _trayWork = Future<void>.value();
+  Future<void> _windowWork = Future<void>.value();
+  Future<bool>? _hideRequest;
+  Future<void>? _trayCheck;
+  Timer? _trayTimer;
+  bool _hiddenForTray = false;
+  int _windowRevision = 0;
   bool _exitRequested = false;
   bool _exiting = false;
   bool _closed = false;
@@ -267,7 +279,8 @@ class VelumTrayService with tm.TrayListener {
       await trayAdapter.setIcon(iconPath);
       await trayAdapter.setToolTip('Velum — ${_statusLabel(currentState)}');
     } catch (_) {
-      _traySupported = false;
+      // A transient Linux panel/bus failure must not disable future retries.
+      if (!watchTray) _traySupported = false;
       return;
     }
     if (_exiting || _closed || _disposed) return;
@@ -382,24 +395,154 @@ class VelumTrayService with tm.TrayListener {
 
   /// Shows the main GUI window and brings it to the foreground.
   Future<void> showWindow() async {
-    await windowAdapter.show();
+    ++_windowRevision;
+    _stopTrayWatch();
+    try {
+      await _windowAction(() async {
+        if (!_closed) await windowAdapter.show();
+        _hiddenForTray = false;
+      });
+    } catch (_) {
+      // Keep recovery armed if the native show failed while still hidden.
+      _scheduleTrayWatch();
+      rethrow;
+    }
   }
 
   /// Hides the main GUI window to the system tray.
-  Future<void> hideWindow() async {
-    if (await _canHide()) {
-      await windowAdapter.hide();
-    } else {
-      // If tray is unavailable, do not leave window unrecoverable; keep visible.
+  Future<void> hideWindow() async => await _hideToTray();
+
+  Future<void> _windowAction(Future<void> Function() action) {
+    final work = _windowWork.then((_) => action());
+    _windowWork = work.catchError((Object _) {});
+    return work;
+  }
+
+  Future<bool> _hideToTray() {
+    return _hideRequest ??= _performHide().whenComplete(() {
+      _hideRequest = null;
+    });
+  }
+
+  Future<bool> _performHide() async {
+    if (_disposed || _exiting || _closed) return false;
+    final revision = ++_windowRevision;
+    _stopTrayWatch();
+    final available = await _canHide();
+    if (revision != _windowRevision || _disposed || _exiting || _closed) {
+      return true; // A newer show/exit superseded this request.
     }
+    if (!available) {
+      final wasHidden = _hiddenForTray;
+      if (wasHidden) await _showBestEffort();
+      return wasHidden;
+    }
+    try {
+      await _windowAction(() async {
+        if (revision == _windowRevision &&
+            !_disposed &&
+            !_exiting &&
+            !_closed) {
+          _hiddenForTray = true;
+          await windowAdapter.hide();
+        }
+      });
+      if (revision == _windowRevision && !_disposed && !_exiting && !_closed) {
+        // Close the check/hide race before returning to the close controller.
+        if (watchTray) {
+          final previous = _trayCheck;
+          if (previous != null) await previous;
+          if (revision == _windowRevision &&
+              !_disposed &&
+              !_exiting &&
+              !_closed) {
+            await _checkHiddenTray();
+          }
+        }
+        _scheduleTrayWatch();
+      }
+    } catch (_) {
+      await _showBestEffort();
+    }
+    return true;
+  }
+
+  void _stopTrayWatch() {
+    _trayTimer?.cancel();
+    _trayTimer = null;
+  }
+
+  void _scheduleTrayWatch() {
+    if (!watchTray ||
+        !_hiddenForTray ||
+        _disposed ||
+        _exiting ||
+        _closed ||
+        _trayTimer != null ||
+        _trayCheck != null) {
+      return;
+    }
+    _trayTimer = scheduleTrayCheck(trayPollInterval, () {
+      _trayTimer = null;
+      unawaited(_checkHiddenTray());
+    });
+  }
+
+  Future<void> _checkHiddenTray() {
+    if (_trayCheck != null) return _trayCheck!;
+    final revision = _windowRevision;
+    final work = () async {
+      if (!_hiddenForTray || _disposed || _exiting || _closed) return;
+      bool available;
+      try {
+        if (await windowAdapter.isVisible()) {
+          if (revision == _windowRevision) _hiddenForTray = false;
+          return;
+        }
+        available = await trayAdapter.isAvailable();
+      } catch (_) {
+        available = false;
+      }
+      if (revision != _windowRevision || _disposed || _exiting || _closed) {
+        return;
+      }
+      if (!available) await _showBestEffort();
+    }();
+    _trayCheck = work.whenComplete(() {
+      _trayCheck = null;
+      _scheduleTrayWatch();
+    });
+    return _trayCheck!;
   }
 
   Future<bool> _canHide() async {
-    if (!_initialized || !_traySupported || _trayDestruction != null) {
+    if (!_initialized ||
+        !_traySupported ||
+        _trayDestruction != null ||
+        _disposed ||
+        _exiting ||
+        _closed) {
       return false;
     }
     try {
-      return await trayAdapter.isAvailable();
+      if (await trayAdapter.isAvailable()) return true;
+      if (!watchTray) return false;
+      // cnativeapi registers once at creation, not when a watcher reappears.
+      // Retry only on a user hide request, serialized with menu updates/exit.
+      final work = _trayWork.then((_) async {
+        if (_disposed || _exiting || _closed || _trayDestruction != null) {
+          return;
+        }
+        await trayAdapter.destroy();
+        await _updateTray(force: true);
+      });
+      _trayWork = work.catchError((Object _) {});
+      await work;
+      return !_disposed &&
+          !_exiting &&
+          !_closed &&
+          _trayDestruction == null &&
+          await trayAdapter.isAvailable();
     } catch (_) {
       return false;
     }
@@ -419,22 +562,15 @@ class VelumTrayService with tm.TrayListener {
 
   Future<void> _showBestEffort() async {
     try {
-      await windowAdapter.show();
+      await showWindow();
     } catch (_) {}
   }
 
   Future<void> _processClose() async {
     if (!_exitRequested &&
         client.settings['minimizeToTray'] == true &&
-        await _canHide()) {
-      if (!_exitRequested && !_disposed) {
-        try {
-          await windowAdapter.hide();
-          if (!_exitRequested) return;
-        } catch (_) {
-          /* Continue with a visible, controlled exit. */
-        }
-      }
+        await _hideToTray()) {
+      if (!_exitRequested || _disposed) return;
     }
     await _showBestEffort();
     if (_disposed) return;
@@ -446,6 +582,7 @@ class VelumTrayService with tm.TrayListener {
     }
     if (_disposed) return;
     _exiting = true;
+    _stopTrayWatch();
     var retry = false;
     var force = false;
     while (!_disposed) {
@@ -457,7 +594,7 @@ class VelumTrayService with tm.TrayListener {
         } catch (_) {
           if (!force) rethrow;
         }
-        await windowAdapter.close();
+        await _windowAction(windowAdapter.close);
         _closed = true;
         windowAdapter.setCloseRequestHandler(null);
         return;
@@ -488,6 +625,10 @@ class VelumTrayService with tm.TrayListener {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    ++_windowRevision;
+    _stopTrayWatch();
+    // A pending native hide must finish before this final best-effort reveal.
+    if (_hiddenForTray) unawaited(_showBestEffort());
     windowAdapter.setCloseRequestHandler(null);
     client.removeListener(_onClientChanged);
     trayAdapter.removeListener(this);
