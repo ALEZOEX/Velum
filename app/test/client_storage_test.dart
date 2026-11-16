@@ -36,10 +36,15 @@ void main() {
         await File('${directory.path}/profiles.v1.backup.json').readAsString(),
         original,
       );
-      expect(
-        (await File('${directory.path}/profiles.json').stat()).mode & 0x1ff,
-        0x180,
-      );
+      if (Platform.isLinux || Platform.isMacOS) {
+        for (final name in ['profiles.json', 'profiles.v1.backup.json']) {
+          expect(
+            (await File('${directory.path}/$name').stat()).mode & 0x1ff,
+            0x180,
+            reason: '$name must remain private on POSIX filesystems',
+          );
+        }
+      }
     },
   );
   test('Backup roundtrip keeps favorite, custom name and selection; invalid backup is atomic', () async {

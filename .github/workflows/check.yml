@@ -27,6 +27,42 @@ jobs:
       - name: Smoke-build daemon (windows cross)
         run: cd daemon && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ../bin/velumd.exe .
 
+  daemon-windows-unit:
+    name: Windows service security unit tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: daemon/go.sum
+      - name: Native descriptor, path and install-policy tests (no SCM changes)
+        working-directory: daemon
+        run: go test -v -run '^TestService' ./...
+      - name: NTFS fixtures in disposable hosted Windows VM (no SCM changes)
+        working-directory: daemon
+        shell: pwsh
+        run: |
+          go test -c -o "$env:RUNNER_TEMP\velum-f1.test.exe" .
+          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture test compilation failed.' }
+          & ..\scripts\test-windows-service-acl.ps1 -TestBinary "$env:RUNNER_TEMP\velum-f1.test.exe" -DisposableVM
+      - name: Real SCM and standard-user ACL checks in disposable hosted VM
+        working-directory: daemon
+        shell: pwsh
+        run: |
+          go build -o "$env:RUNNER_TEMP\velum-f1-daemon.exe" .
+          if ($LASTEXITCODE -ne 0) { throw 'Daemon compilation failed.' }
+          go build -o "$env:RUNNER_TEMP\velum-f1-core.exe" ./testdata/f1-core
+          if ($LASTEXITCODE -ne 0) { throw 'Inert core fixture compilation failed.' }
+          & ..\scripts\test-windows-service-scm.ps1 -DaemonBinary "$env:RUNNER_TEMP\velum-f1-daemon.exe" -CoreFixture "$env:RUNNER_TEMP\velum-f1-core.exe" -DisposableVM
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-service-scm-results
+          path: ${{ runner.temp }}/velum-f1-scm-results.json
+          if-no-files-found: warn
+
   flutter-windows:
     name: Flutter / Windows
     runs-on: windows-latest
@@ -47,6 +83,9 @@ jobs:
   flutter-linux:
     name: Flutter / ${{ matrix.distro }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
 
     strategy:
       fail-fast: false
@@ -56,37 +95,53 @@ jobs:
             container: ''
             setup_deps: |
               sudo apt-get update
-              sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev
+              sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev jq curl unzip git xz-utils
 
           - distro: debian
             container: debian:latest
             setup_deps: |
               apt-get update
-              apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev curl unzip git xz-utils
+              apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev curl unzip git xz-utils jq
 
           - distro: arch
             container: archlinux:latest
             setup_deps: |
               pacman -Syu --noconfirm
-              pacman -S --noconfirm clang cmake ninja pkgconf gtk3 curl unzip git which xz
+              pacman -S --noconfirm clang cmake ninja pkgconf gtk3 curl unzip git which xz jq
 
           - distro: opensuse
             container: opensuse/leap:latest
             setup_deps: |
-              zypper install -y clang cmake ninja pkgconf-pkg-config gtk3-devel curl unzip git xz
+              zypper install -y clang gcc-c++ cmake ninja pkgconf-pkg-config gtk3-devel curl unzip git xz jq which
 
     container:
       image: ${{ matrix.container }}
+      # The runner appends image Config.Env PATH after action tool paths.
+      # A job-level PATH is overridden by that logic on images without PATH.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
         run: ${{ matrix.setup_deps }}
+      - name: Verify Flutter build and setup tools
+        run: |
+          for tool in jq curl unzip git xz tar bash which clang clang++ cmake ninja pkg-config; do
+            command -v "$tool" || exit 1
+          done
+          pkg-config --exists gtk+-3.0
+          printf '%s\n' '#include <iostream>' 'int main() { return 0; }' |
+            clang++ -x c++ - -o "$RUNNER_TEMP/velum-cxx-check"
+          "$RUNNER_TEMP/velum-cxx-check"
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: Trust the downloaded Flutter SDK for this container user
+        if: matrix.container != ''
+        run: git config --global --add safe.directory "$FLUTTER_ROOT"
       - name: Analyze & test
         working-directory: app
         run: flutter pub get && flutter analyze && flutter test

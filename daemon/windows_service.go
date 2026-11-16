@@ -4,18 +4,12 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -29,17 +23,6 @@ const (
 	serviceDisplayName = "Velum VPN service"
 	serviceDescription = "Privileged Velum network engine: sing-box, optional Xray companion, proxy API and TUN."
 )
-
-// ProgramData keeps the installed service binaries and token outside the
-// user-writable release directory. Otherwise a standard user could replace
-// velumd.exe and obtain LocalSystem privileges.
-func serviceDataDir() (string, error) {
-	base := os.Getenv("ProgramData")
-	if base == "" {
-		return "", errors.New("ProgramData is not defined")
-	}
-	return filepath.Join(base, "Velum"), nil
-}
 
 func runServiceAction(action string, cfg daemonConfig, account string) error {
 	switch action {
@@ -61,257 +44,191 @@ func requireElevation() error {
 	return errors.New("this action requires an elevated administrator shell")
 }
 
-func hiddenCommand(name string, args ...string) *exec.Cmd {
-	command := exec.Command(name, args...)
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return command
-}
-
-func currentUserSID() string {
-	account, err := user.Current()
-	if err != nil || account.Uid == "" {
-		return ""
-	}
-	return account.Uid
-}
-
-// restrictACL removes inherited permissions and grants SYSTEM/Administrators
-// full control plus read access to the installing user only.
-func restrictACL(path string, directory bool) error {
-	sid := currentUserSID()
-	inheritance := "(OI)(CI)"
-	if !directory {
-		inheritance = ""
-	}
-	args := []string{path, "/inheritance:r", "/grant:r", "*S-1-5-18:" + inheritance + "(F)", "*S-1-5-32-544:" + inheritance + "(F)"}
-	if sid != "" {
-		args = append(args, "*"+sid+":"+inheritance+"(R)")
-	}
-	if output, err := hiddenCommand("icacls", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to restrict ACL on %s: %w: %s", path, err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
-func ensureServiceDataDir() (string, error) {
-	dir, err := serviceDataDir()
-	if err != nil {
-		return "", err
-	}
-	if err = os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("failed to create %s: %w", dir, err)
-	}
-	if err = restrictACL(dir, true); err != nil {
-		return "", err
-	}
-	bin := filepath.Join(dir, "bin")
-	if err = os.MkdirAll(bin, 0700); err != nil {
-		return "", fmt.Errorf("failed to create %s: %w", bin, err)
-	}
-	if err = restrictACL(bin, true); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-func ensureToken(path string) error {
-	if info, err := os.Stat(path); err == nil {
-		if !info.Mode().IsRegular() || info.Size() > 256 {
-			return errors.New("existing service token is not a regular file")
-		}
-		if err = restrictACL(path, false); err != nil {
-			return err
-		}
-		return nil
-	}
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return fmt.Errorf("failed to generate token: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
-	}
-	_, writeErr := file.WriteString(hex.EncodeToString(raw) + "\n")
-	closeErr := file.Close()
-	if writeErr != nil {
-		return fmt.Errorf("failed to write token file: %w", writeErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("failed to close token file: %w", closeErr)
-	}
-	return restrictACL(path, false)
-}
-
-func copyExecutable(source, destination string) error {
-	input, err := os.Open(source)
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", source, err)
-	}
-	defer input.Close()
-	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
-	if err != nil {
-		return fmt.Errorf("failed to create %s: %w", destination, err)
-	}
-	if _, err = io.Copy(output, input); err != nil {
-		_ = output.Close()
-		return fmt.Errorf("failed to copy %s: %w", source, err)
-	}
-	if err = output.Close(); err != nil {
-		return fmt.Errorf("failed to close %s: %w", destination, err)
-	}
-	return nil
-}
-
 func installService(cfg daemonConfig, account string) error {
-	if err := requireElevation(); err != nil {
-		return err
-	}
+	var tree *serviceTree
+	var manager *mgr.Mgr
+	var created *mgr.Service
+	defer func() {
+		if created != nil {
+			_ = created.Close()
+		}
+		if manager != nil {
+			_ = manager.Disconnect()
+		}
+		if tree != nil {
+			tree.close()
+		}
+	}()
+	var currentExe string
 	explicitToken := cfg.tokenFile
-	if err := resolvePaths(&cfg); err != nil {
-		return err
-	}
-	if !filepath.IsAbs(cfg.core) {
-		return errors.New("core path must be absolute")
-	}
-	if _, err := os.Stat(cfg.core); err != nil {
-		return fmt.Errorf("sing-box executable not found: %w", err)
-	}
-	if cfg.xray != "" {
-		if _, err := os.Stat(cfg.xray); err != nil {
-			return fmt.Errorf("Xray executable not found: %w", err)
-		}
-	}
-	manager, err := mgr.Connect()
-	if err != nil {
-		return fmt.Errorf("failed to connect to the service manager: %w", err)
-	}
-	defer manager.Disconnect()
-	if existing, openErr := manager.OpenService(serviceName); openErr == nil {
-		_ = existing.Close()
-		return errors.New("the Velum service is already installed; uninstall it before reinstalling")
-	}
-	dataDir, err := ensureServiceDataDir()
-	if err != nil {
-		return err
-	}
-	tokenPath := cfg.tokenFile
-	if explicitToken == "" {
-		tokenPath = filepath.Join(dataDir, "token")
-	}
-	if !filepath.IsAbs(tokenPath) {
-		return errors.New("token path must be absolute")
-	}
-	if err = ensureToken(tokenPath); err != nil {
-		return err
-	}
-	binDir := filepath.Join(dataDir, "bin")
-	serviceExe := filepath.Join(binDir, "velumd.exe")
-	coreExe := filepath.Join(binDir, "sing-box.exe")
-	currentExe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to locate the current executable: %w", err)
-	}
-	if err = copyExecutable(currentExe, serviceExe); err != nil {
-		return err
-	}
-	if err = copyExecutable(cfg.core, coreExe); err != nil {
-		return err
-	}
-	args := []string{"--service", "run", "--core", coreExe, "--token-file", tokenPath}
-	if cfg.tunAllowed {
-		args = append(args, "--tun")
-	}
-	if cfg.xray != "" {
-		xrayExe := filepath.Join(binDir, "xray.exe")
-		if err = copyExecutable(cfg.xray, xrayExe); err != nil {
+	return runServiceInstall(serviceInstallPlan{
+		elevate: requireElevation,
+		prepare: func() error {
+			if err := resolvePaths(&cfg); err != nil {
+				return err
+			}
+			dataDir, err := serviceDataDir()
+			if err != nil {
+				return err
+			}
+			tokenPath := filepath.Join(dataDir, "token")
+			if explicitToken != "" && !strings.EqualFold(explicitToken, tokenPath) {
+				return errors.New("service token must be the canonical ProgramData/Velum/token; external token paths are refused")
+			}
+			cfg.tokenFile = tokenPath
+			currentExe, err = os.Executable()
+			if err != nil {
+				return err
+			}
+			manager, err = mgr.Connect()
+			if err != nil {
+				return err
+			}
+			existing, err := manager.OpenService(serviceName)
+			if err == nil {
+				_ = existing.Close()
+				return errors.New("Velum service is already installed; no files were changed; uninstall before reinstalling")
+			}
+			if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+				return fmt.Errorf("cannot establish service absence: %w", err)
+			}
+			tree, err = openServiceTree(true)
 			return err
-		}
-		args = append(args, "--xray", xrayExe)
-	}
-	if cfg.interfaceName != "" {
-		args = append(args, "--interface", cfg.interfaceName)
-	}
-	if err = eventlog.InstallAsEventCreate(serviceName, eventlog.Info|eventlog.Warning|eventlog.Error); err != nil {
-		log.Printf("event log source was not installed: %v", err)
-	}
-	created, err := manager.CreateService(serviceName, serviceExe, mgr.Config{
-		DisplayName:      serviceDisplayName,
-		Description:      serviceDescription,
-		StartType:        mgr.StartAutomatic,
-		DelayedAutoStart: true,
-		ServiceStartName: account,
-	}, args...)
-	if err != nil {
-		return fmt.Errorf("failed to create the Velum service: %w", err)
-	}
-	defer created.Close()
-	recovery := []mgr.RecoveryAction{
-		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
-		{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
-		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
-	}
-	if err = created.SetRecoveryActions(recovery, 3600); err != nil {
-		_ = created.Delete()
-		return fmt.Errorf("failed to configure service recovery: %w", err)
-	}
-	if err = created.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
-		_ = created.Delete()
-		return fmt.Errorf("failed to configure recovery on non-crash failures: %w", err)
-	}
-	if err = created.Start(); err != nil {
-		_ = created.Delete()
-		return fmt.Errorf("failed to start the Velum service: %w", err)
-	}
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		status, queryErr := created.Query()
-		if queryErr == nil && status.State == svc.Running {
+		},
+		files: []func() error{
+			func() error { return tree.ensureToken() },
+			func() error { return tree.copyExecutable(currentExe, "velumd.exe") },
+			func() error { return tree.copyExecutable(cfg.core, "sing-box.exe") },
+			func() error {
+				if cfg.xray != "" {
+					return tree.copyExecutable(cfg.xray, "xray.exe")
+				}
+				return nil
+			},
+		},
+		verify: func() error { return tree.verify() },
+		register: func() error {
+			binDir := filepath.Join(tree.dir, "bin")
+			args := []string{"--service", "run", "--core", filepath.Join(binDir, "sing-box.exe"), "--token-file", cfg.tokenFile}
+			if cfg.tunAllowed {
+				args = append(args, "--tun")
+			}
+			if cfg.xray != "" {
+				args = append(args, "--xray", filepath.Join(binDir, "xray.exe"))
+			}
+			if cfg.interfaceName != "" {
+				args = append(args, "--interface", cfg.interfaceName)
+			}
+			var err error
+			created, err = manager.CreateService(serviceName, filepath.Join(binDir, "velumd.exe"), mgr.Config{
+				DisplayName: serviceDisplayName, Description: serviceDescription, StartType: mgr.StartAutomatic, DelayedAutoStart: true, ServiceStartName: account,
+			}, args...)
+			if err != nil {
+				return fmt.Errorf("register verified service: %w", err)
+			}
+			if err = eventlog.InstallAsEventCreate(serviceName, eventlog.Info|eventlog.Warning|eventlog.Error); err != nil {
+				log.Printf("event log source was not installed: %v", err)
+			}
 			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	return errors.New("the Velum service did not reach the running state; inspect the Windows event log")
+		},
+		start: func() error {
+			// Re-read descriptors after registration as well, before first execution.
+			if err := tree.verify(); err != nil {
+				return err
+			}
+			recovery := []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 5 * time.Second}, {Type: mgr.ServiceRestart, Delay: 15 * time.Second}, {Type: mgr.ServiceRestart, Delay: 60 * time.Second}}
+			if err := created.SetRecoveryActions(recovery, 3600); err != nil {
+				return err
+			}
+			if err := created.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
+				return err
+			}
+			if err := created.Start(); err != nil {
+				return fmt.Errorf("start verified service: %w", err)
+			}
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				status, err := created.Query()
+				if err != nil {
+					return err
+				}
+				if status.State == svc.Running {
+					return nil
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			return errors.New("service did not reach running state; inspect the Windows event log")
+		},
+		rollback: func() error {
+			disable := windows.ChangeServiceConfig(created.Handle, windows.SERVICE_NO_CHANGE, windows.SERVICE_DISABLED, windows.SERVICE_NO_CHANGE, nil, nil, nil, nil, nil, nil, nil)
+			_, stop := created.Control(svc.Stop)
+			if errors.Is(stop, windows.ERROR_SERVICE_NOT_ACTIVE) {
+				stop = nil
+			}
+			return errors.Join(disable, stop, created.Delete())
+		},
+	})
 }
 
 func uninstallService() error {
-	if err := requireElevation(); err != nil {
-		return err
-	}
+	var tree *serviceTree
+	defer func() {
+		if tree != nil {
+			tree.close()
+		}
+	}()
+	return runServiceRemoval(requireElevation, func() error {
+		var err error
+		tree, err = openServiceTree(false)
+		if err != nil {
+			return err
+		}
+		return tree.verify()
+	}, func() error { return uninstallVerifiedService(tree) })
+}
+
+func uninstallVerifiedService(tree *serviceTree) error {
 	manager, err := mgr.Connect()
 	if err != nil {
-		return fmt.Errorf("failed to connect to the service manager: %w", err)
+		return err
 	}
 	defer manager.Disconnect()
 	service, err := manager.OpenService(serviceName)
 	if err != nil {
-		return errors.New("the Velum service is not installed")
+		return fmt.Errorf("open service for uninstall: %w", err)
 	}
-	status, _ := service.Query()
+	defer service.Close()
+	status, err := service.Query()
+	if err != nil {
+		return err
+	}
 	if status.State != svc.Stopped {
 		if _, err = service.Control(svc.Stop); err != nil {
-			_ = service.Close()
-			return fmt.Errorf("failed to stop the Velum service: %w", err)
+			return err
 		}
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
-			status, _ = service.Query()
+			status, err = service.Query()
+			if err != nil {
+				return err
+			}
 			if status.State == svc.Stopped {
 				break
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
+		if status.State != svc.Stopped {
+			return errors.New("service did not stop; no files were removed")
+		}
+	}
+	if err = tree.verify(); err != nil {
+		return err
 	}
 	if err = service.Delete(); err != nil {
-		_ = service.Close()
-		return fmt.Errorf("failed to delete the Velum service: %w", err)
+		return err
 	}
-	_ = service.Close()
 	_ = eventlog.Remove(serviceName)
-	if dir, dirErr := serviceDataDir(); dirErr == nil {
-		_ = os.RemoveAll(filepath.Join(dir, "bin"))
-	}
-	return nil
+	return tree.removeBinaries()
 }
 
 type velumWindowsService struct {
