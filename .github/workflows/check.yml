@@ -30,6 +30,7 @@ jobs:
   daemon-windows-unit:
     name: Windows service security unit tests
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -82,6 +83,13 @@ jobs:
   flutter-linux:
     name: Flutter / ${{ matrix.distro }}
     runs-on: ubuntu-latest
+    # Flutter's PATH entries are prepended by the action. Keep the container's
+    # system tools available independently of the Ubuntu host runner PATH.
+    env:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
 
     strategy:
       fail-fast: false
@@ -128,6 +136,9 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: Trust the downloaded Flutter SDK for this container user
+        if: matrix.container != ''
+        run: git config --global --add safe.directory "$FLUTTER_ROOT"
       - name: Analyze & test
         working-directory: app
         run: flutter pub get && flutter analyze && flutter test
