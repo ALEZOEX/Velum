@@ -1,10 +1,11 @@
 # F1: Windows service installation boundary
 
-Status: implemented candidate, **not confirmed closed** until native NTFS and
-SCM behavior and standard-user access are validated on a suitable disposable Windows VM. Linux mocks,
-Windows cross-compilation, Wine and in-memory descriptor tests are insufficient
-for that conclusion. No Windows service installation was performed during the
-Linux development session.
+Status: implemented candidate, **not confirmed fully closed**. Native NTFS,
+real SCM lifecycle and standard-user access checks have passed on a disposable
+hosted Windows Server 2025 VM. The full adversarial matrix below and Windows 11
+GUI/UAC installation remain pending. Linux mocks, Windows cross-compilation,
+Wine and in-memory descriptor tests alone are insufficient. No service or VPN
+was installed on the developer's Linux machine or a physical Windows host.
 
 ## Threat model and root cause
 
@@ -100,8 +101,9 @@ compatibility cost of closing this boundary.
 
 ## Remaining limits
 
-- Native filesystem/SCM semantics still require actual Windows validation,
-  including share-mode compatibility with the image loader and security software.
+- Native filesystem/SCM checks passed on the recorded hosted image with inert
+  cores. Windows 11 GUI/UAC flow, real core packages and security-software
+  interactions remain unverified.
 - Attribute-writable ancestors require an existing anchor. Minimal/custom
   installations without a usable Microsoft directory may be conservatively
   refused rather than implicitly trusted or reconfigured.
@@ -124,6 +126,33 @@ compatibility cost of closing this boundary.
   migration procedure; invoking this installer does not make it trustworthy.
 
 ## Verification layers
+
+### Recorded native runtime evidence
+
+On 2026-11-16, commit `1f7c7555ee48ad4cc3038012964bbcd7d2b5a68f` passed
+[Windows security job 133397922880](https://github.com/ALEZOEX/Velum/actions/runs/43895523430/job/133397922880)
+on Microsoft Windows Server 2025, hosted image `windows-2025-vs2026`
+`20261103.298`. Both the opt-in NTFS fixture and the real SCM script passed.
+The [JSON results artifact](https://github.com/ALEZOEX/Velum/actions/runs/43895523430/artifacts/14237444541)
+records completed checks; Actions artifacts have finite retention.
+
+Confirmed runtime scenarios: clean install/start as LocalSystem using the
+canonical path; existing-service refusal without restart; stop/restart;
+authenticated disconnected status with no running engine/TUN and missing-token
+HTTP 401; exact owner/DACL readback; actual standard-user denial of content,
+attribute, delete, ACL and owner writes; outside-user token read denial;
+production uninstall and retained protected recovery token; refusal of unsafe
+root/token/executable ACLs and a bin junction without modifying an outside
+sentinel; unsafe uninstall refusal before SCM deletion; successful retry after
+explicit fixture correction; final service, account and sandbox cleanup.
+
+Still not confirmed through full SCM runtime: arbitrary-user ownership,
+executable symlink/hard-link and unsafe token-type combinations; non-elevated
+installer execution; injected native SetSecurityInfo/GetSecurityInfo failures;
+second/third source-publication failures across the complete installer. Portable
+policy/fault tests and the opt-in filesystem test cover parts of these cases,
+which is a different level of evidence. The Windows 11 matrix remains useful
+and F1 is not declared closed from the hosted subset.
 
 `service_install_policy_test.go` runs on Linux and Windows. It tests exact owner,
 DACL, type, link and ancestor decisions and production install/remove ordering

@@ -24,7 +24,10 @@ Local NTFS is required. Reparse points, unsafe ancestors, unexpected children,
 hard-linked files and pre-existing objects outside the controlled owner/DACL
 policy cause refusal without automatic ACL repair or overwrite.
 
-**F1 remains pending Windows filesystem/SCM runtime validation.** See the
+**F1 has partial native Windows validation; it is not marked fully closed.**
+Hosted Windows Server 2025 passed NTFS, real SCM lifecycle and standard-user
+access checks with version-only inert core fixtures, without VPN/TUN. The full
+negative matrix and packaged GUI/UAC flow remain pending. See the
 [security design and disposable Windows 11 validation procedure](windows-service-acl.md).
 
 ## Installation
@@ -165,11 +168,22 @@ Automated on Linux:
 - generated Windows TUN config validated by the pinned sing-box core
 - `flutter analyze`, `flutter test`
 
-Not verified without a real Windows host:
+Verified on a disposable hosted Windows Server 2025 VM:
+
+- real daemon SCM install/start/stop/restart/uninstall as LocalSystem, idle API
+- exact owner/protected DACL readback and actual standard-user access denial
+- foreign-user Bearer token read denial and unauthenticated API rejection
+- unsafe root/token/executable ACL and junction install refusal, unsafe uninstall
+- corrected-fixture retry and test resource cleanup
+
+These checks use version-only inert sing-box/Xray substitutes. See the
+[recorded evidence and remaining matrix](windows-service-acl.md).
+
+Not verified:
 
 - Wintun adapter creation and packet flow
 - Windows route and DNS restoration after a forced engine crash
-- Service Control Manager start/stop timing under recovery
+- Service Control Manager crash recovery timing
 - UAC install flow from a packaged GUI
 - proxy mode against a live provider
 - interaction with third-party VPN adapters and Windows Filtering Platform
