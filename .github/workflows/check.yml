@@ -112,7 +112,7 @@ jobs:
           - distro: opensuse
             container: opensuse/leap:latest
             setup_deps: |
-              zypper install -y clang cmake ninja pkgconf-pkg-config gtk3-devel curl unzip git xz jq which
+              zypper install -y clang gcc-c++ cmake ninja pkgconf-pkg-config gtk3-devel curl unzip git xz jq which
 
     container:
       image: ${{ matrix.container }}
@@ -127,10 +127,13 @@ jobs:
         run: ${{ matrix.setup_deps }}
       - name: Verify Flutter build and setup tools
         run: |
-          for tool in jq curl unzip git xz tar bash which clang cmake ninja pkg-config; do
+          for tool in jq curl unzip git xz tar bash which clang clang++ cmake ninja pkg-config; do
             command -v "$tool" || exit 1
           done
           pkg-config --exists gtk+-3.0
+          printf '%s\n' '#include <iostream>' 'int main() { return 0; }' |
+            clang++ -x c++ - -o "$RUNNER_TEMP/velum-cxx-check"
+          "$RUNNER_TEMP/velum-cxx-check"
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
