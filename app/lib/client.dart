@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 
 import 'imports.dart';
+import 'linux_service.dart';
 import 'models.dart';
 import 'system_proxy.dart';
 export 'models.dart';
@@ -75,18 +76,22 @@ class VelumClient extends ChangeNotifier {
     this.proxyManager,
     this.daemonRequest,
     this.proxyListenerProbe,
+    LinuxServiceController? linuxServiceController,
   }) : directory =
            directory ??
            Directory(
              Platform.environment['VELUM_CONFIG_DIR'] ??
                  '${Platform.environment['HOME'] ?? Platform.environment['USERPROFILE']}/.config/velum',
            ),
-       apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/');
+       apiBase = apiBase ?? Uri.parse('http://127.0.0.1:27841/v1/'),
+       _linuxServiceController =
+           linuxServiceController ?? LinuxServiceController();
 
   final Directory directory;
   final Uri apiBase;
   final DaemonRequest? daemonRequest;
   final ProxyListenerProbe? proxyListenerProbe;
+  final LinuxServiceController _linuxServiceController;
   SystemProxyManager? proxyManager;
   SystemProxyStatus systemProxyStatus = SystemProxyStatus.disabled;
 
@@ -1531,20 +1536,6 @@ class VelumClient extends ChangeNotifier {
     }
   }
 
-  Future<ProcessResult> _runPrivilegedLinuxCommand(List<String> command) async {
-    final checkPkexec = await Process.run('which', ['pkexec']);
-    if (checkPkexec.exitCode != 0) {
-      throw const FormatException(
-        'Утилита pkexec не найдена в системе. Установите пакет polkit.',
-      );
-    }
-    try {
-      return await Process.run('pkexec', command);
-    } on ProcessException catch (e) {
-      throw FormatException('Ошибка запуска pkexec: ${e.message}');
-    }
-  }
-
   Future<void> startLinuxService() async {
     if (!Platform.isLinux) {
       throw const FormatException('Действие доступно только на Linux.');
@@ -1555,15 +1546,7 @@ class VelumClient extends ChangeNotifier {
       );
     }
 
-    final controlScript = File('/usr/local/lib/velum/velum-service-control');
-    List<String> command;
-    if (await controlScript.exists()) {
-      command = [controlScript.path, 'start'];
-    } else {
-      command = ['systemctl', 'start', 'velum.service'];
-    }
-
-    final result = await _runPrivilegedLinuxCommand(command);
+    final result = await _linuxServiceController.control('start');
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       if (result.exitCode == 126 ||
@@ -1603,15 +1586,7 @@ class VelumClient extends ChangeNotifier {
     if (!Platform.isLinux) {
       throw const FormatException('Действие доступно только на Linux.');
     }
-    final controlScript = File('/usr/local/lib/velum/velum-service-control');
-    List<String> command;
-    if (await controlScript.exists()) {
-      command = [controlScript.path, 'stop'];
-    } else {
-      command = ['systemctl', 'stop', 'velum.service'];
-    }
-
-    final result = await _runPrivilegedLinuxCommand(command);
+    final result = await _linuxServiceController.control('stop');
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       if (result.exitCode == 126 || stderr.contains('dismissed')) {
@@ -1627,18 +1602,7 @@ class VelumClient extends ChangeNotifier {
     if (!Platform.isLinux) {
       throw const FormatException('Действие доступно только на Linux.');
     }
-    final controlScript = File('/usr/local/lib/velum/velum-service-control');
-    final uninstallScript = File('/usr/local/lib/velum/uninstall-service.sh');
-    List<String> command;
-    if (await controlScript.exists()) {
-      command = [controlScript.path, 'uninstall'];
-    } else if (await uninstallScript.exists()) {
-      command = [uninstallScript.path];
-    } else {
-      command = ['systemctl', 'disable', '--now', 'velum.service'];
-    }
-
-    final result = await _runPrivilegedLinuxCommand(command);
+    final result = await _linuxServiceController.control('uninstall');
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       if (result.exitCode == 126 || stderr.contains('dismissed')) {
@@ -1661,25 +1625,17 @@ class VelumClient extends ChangeNotifier {
     }
     await _ensureClientToken();
 
-    final trustedInstaller = File('/usr/local/lib/velum/install-service.sh');
-    if (await trustedInstaller.exists()) {
-      final user = Platform.environment['USER'] ?? '';
-      final result = await _runPrivilegedLinuxCommand([
-        trustedInstaller.path,
-        if (user.isNotEmpty) ...['--user', user],
-      ]);
-      if (result.exitCode != 0) {
-        final stderr = result.stderr.toString().trim();
-        if (result.exitCode == 126 || stderr.contains('dismissed')) {
-          throw const FormatException('Авторизация отменена пользователем.');
-        }
-        throw FormatException('Ошибка установки службы: $stderr');
+    final result = await _linuxServiceController.install(
+      tokenFile: _tokenFile.absolute.path,
+    );
+    if (result.exitCode != 0) {
+      final stderr = result.stderr.toString().trim();
+      if (result.exitCode == 126 || stderr.contains('dismissed')) {
+        throw const FormatException('Авторизация отменена пользователем.');
       }
-      await refresh();
-      return;
+      throw FormatException('Ошибка установки службы: $stderr');
     }
-
-    throw const FormatException('trusted-installer-required');
+    await refresh();
   }
 
   List<int> _utf16le(String value) {
