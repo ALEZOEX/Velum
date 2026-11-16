@@ -11,7 +11,8 @@ if [[ ${1:-} != --inside ]]; then
   if [[ ${1:-} == --disposable-ci ]]; then
     [[ $EUID == 0 && ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 1
     /usr/bin/systemd-detect-virt --vm --quiet || exit 1
-    exec unshare --mount --mount-proc --pid --fork --net \
+    exec unshare --user --map-users=0:0:65536 --map-groups=0:0:65536 \
+      --mount --mount-proc --pid --fork --net \
       /bin/bash "${BASH_SOURCE[0]}" --inside "$host_netns"
   fi
   [[ $# == 0 && $EUID != 0 ]] || { printf 'Run as an ordinary user; no sudo fallback.\n' >&2; exit 1; }
