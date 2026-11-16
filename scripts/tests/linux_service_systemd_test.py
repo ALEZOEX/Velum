@@ -23,6 +23,19 @@ def run(*args, success=True):
     return result
 
 
+def unit_files():
+    result = subprocess.run(['/usr/bin/systemctl', 'list-unit-files', '--output=json',
+                             '--no-legend', 'velum.service'], capture_output=True, text=True)
+    # New systemd returns 1 for an empty match. An actual command/bus failure
+    # must still fail the test; require clean stderr and a valid JSON array.
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        raise RuntimeError(f'Could not enumerate units: {result.stderr}')
+    records = json.loads(result.stdout)
+    if not isinstance(records, list):
+        raise RuntimeError('Expected a unit-file JSON array')
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--disposable-ci', action='store_true', required=True)
@@ -41,7 +54,7 @@ def main():
     for path in (base, unit, config, policy):
         if path.exists() or path.is_symlink():
             raise RuntimeError(f'Existing state must not be touched: {path}')
-    if run('/usr/bin/systemctl', 'list-unit-files', 'velum.service').stdout.count('velum.service'):
+    if unit_files():
         raise RuntimeError('An existing vendor service must not be touched')
     uid = int(os.environ['SUDO_UID'])
     if uid == 0:
@@ -142,7 +155,7 @@ def main():
         invoke(base / 'velum-service-control', 'uninstall')
         assert not any(p.exists() for p in (base, unit, config, policy))
         assert token_file.exists()
-        assert not run('/usr/bin/systemctl', 'list-unit-files', 'velum.service').stdout.count('velum.service')
+        assert not unit_files()
         checks.append('real systemd uninstall removes only service resources; GUI token survives')
         base.symlink_to(repo, target_is_directory=True)
         try:
