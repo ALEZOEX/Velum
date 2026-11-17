@@ -102,10 +102,12 @@ def record_routing(peer_pid, label):
 def capture_packets(folder, peer_pid):
     captures=[]
     try:
+        # Ubuntu tcpdump defaults to an unmapped service UID. Keep namespace UID0;
+        # the wrapper already isolates user/net/mount/PID and maps no host root.
         for name, prefix in [('client', []), ('peer', ['nsenter', '-t', str(peer_pid), '-n', '--'])]:
             path=folder/(name+'-packets.log')
             with path.open('w') as f:
-                process=subprocess.Popen(prefix+['tcpdump', '-l', '-n', '-tt', '-i', 'any', 'tcp port 8080'], stdout=f, stderr=subprocess.STDOUT)
+                process=subprocess.Popen(prefix+['tcpdump', '-Z', 'root', '-l', '-n', '-tt', '-i', 'any', 'tcp port 8080'], stdout=f, stderr=subprocess.STDOUT)
             captures.append((name, process, path))
         time.sleep(.2)
         for _, process, _ in captures:
