@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
+	golang.org/x/net v0.43.0
 	golang.org/x/sys v0.41.0
 )
 
