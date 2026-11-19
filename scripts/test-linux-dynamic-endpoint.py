@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -97,18 +98,27 @@ def isolated(baseline):
         or {r['ifname'] for r in json.loads(lab.run('ip', '-j', 'link'))} != {'lo'}
     ):
         raise RuntimeError('F10 fixture requires fresh network, mount and PID namespaces')
-    resolver = Path('/etc/resolv.conf').resolve()
     lab.run('mount', '--make-rprivate', '/')
     lab.run('mount', '-t', 'tmpfs', '-o', 'mode=0755', 'tmpfs', '/run')
-    if str(resolver).startswith('/run/'):
-        resolver.parent.mkdir(parents=True, exist_ok=True)
-        resolver.touch()
-    assert resolver.is_file()
-    with tempfile.TemporaryDirectory(prefix='velum-f10-') as tmp:
+    with ExitStack() as cleanup:
+        tmp = cleanup.enter_context(tempfile.TemporaryDirectory(prefix='velum-f10-'))
         folder = Path(tmp)
-        resolv = folder / 'resolv.conf'
-        resolv.write_text('nameserver 127.0.0.53\noptions attempts:1 timeout:1\n')
-        lab.run('mount', '--bind', str(resolv), str(resolver))
+        # Replace resolv.conf in a private /etc view. The host may use a
+        # symlink into /run/systemd/resolve. Recreating its target would
+        # make the daemon try per-link DNS setup against an absent bus.
+        original_etc = folder / 'original-etc'
+        original_etc.mkdir()
+        lab.run('mount', '--bind', '/etc', str(original_etc))
+        cleanup.callback(lab.run, 'umount', str(original_etc))
+        lab.run('mount', '-o', 'remount,bind,ro', str(original_etc))
+        test_etc = folder / 'etc'
+        test_etc.mkdir()
+        for entry in original_etc.iterdir():
+            if entry.name != 'resolv.conf':
+                (test_etc / entry.name).symlink_to(entry)
+        (test_etc / 'resolv.conf').write_text('nameserver 127.0.0.53\noptions attempts:1 timeout:1\n')
+        lab.run('mount', '--bind', str(test_etc), '/etc')
+        cleanup.callback(lab.run, 'umount', '/etc')
         lab.run('ip', 'link', 'set', 'lo', 'up')
         dns = DNS()
         threading.Thread(target=dns.serve_forever, daemon=True).start()
