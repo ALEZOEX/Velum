@@ -396,14 +396,47 @@ def isolated(baseline):
             connect(reconnect=True)
             dns.set(mode='timeout')
             queries = len(dns.queries)
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                request = pool.submit(api, 'reconnect', {}, 409)
-                wait(lambda start=queries: len(dns.queries) > start)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                candidate = {
+                    'uri': 'hy2://velum-local-test@endpoint.velum.test:8443?sni=localhost',
+                    'settings': {'reconnect': True},
+                }
+                connecting = pool.submit(api, 'connect', candidate, 409)
+                wait(lambda: len(dns.queries) > queries)
+                queries = len(dns.queries)
+                reconnecting = pool.submit(api, 'reconnect', {}, 409)
+                assert connecting.result(timeout=5)['error']
+                wait(lambda: len(dns.queries) > queries)
                 assert api('status')['endpoint']['ip'] == old
                 disconnect()
-                assert request.result(timeout=5)['error']
+                assert reconnecting.result(timeout=5)['error']
             assert api('status')['state'] == 'disconnected' and lab.routing_snapshot() == original
-            print('PASS disconnect cancels outstanding reconnect DNS', flush=True)
+            listener = lab.run('ss', '-H', '-ltn', 'sport = :2080')
+            assert not listener.strip(), 'Canceled connections left a listening core'
+            dns.set([old])
+            connect()
+            data('after-competing-commands')
+            disconnect()
+            print('PASS connect -> reconnect -> disconnect; no leftover listener or routes, fresh data', flush=True)
+
+            proxy = connect(mode='proxy')
+            assert proxy['mode'] == 'proxy' and lab.routing_snapshot() == original
+            proof = lab.run(
+                'curl',
+                '--fail',
+                '--silent',
+                '--show-error',
+                '--max-time',
+                '8',
+                '--noproxy',
+                '',
+                '--proxy',
+                'socks5h://' + proxy['proxy'],
+                'http://198.19.0.2:8080/f11-proxy',
+            )
+            assert json.loads(proof) == {'peer': '198.19.0.2', 'path': '/f11-proxy'}
+            disconnect()
+            print('PASS proxy-only HTTP via pinned Hysteria2 with unchanged routes', flush=True)
 
             dns.set([old])
             connect()

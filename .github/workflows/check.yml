@@ -20,8 +20,12 @@ jobs:
         run: test -z "$(gofmt -l daemon)"
       - name: Run tests & vet
         run: make test
+      - name: Race detector
+        run: cd daemon && go test -race ./...
       - name: Windows vet (cross)
         run: cd daemon && GOOS=windows GOARCH=amd64 go vet ./...
+      - name: Compile Windows tests (cross)
+        run: cd daemon && GOOS=windows GOARCH=amd64 go test -c -o "$RUNNER_TEMP/velum.test.exe"
       - name: Smoke-build daemon (linux, static)
         run: cd daemon && CGO_ENABLED=0 go build -o ../bin/velumd .
       - name: Smoke-build daemon (windows cross)
