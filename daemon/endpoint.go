@@ -182,7 +182,7 @@ func (s *service) prepareEndpoint(ctx context.Context, req ConnectRequest) (*end
 func (s *service) observeEndpoint(ctx context.Context) {
 	s.mu.Lock()
 	pin := s.endpoint
-	if pin == nil || s.cmd == nil {
+	if pin == nil || s.cmd == nil || s.state != "running" {
 		s.mu.Unlock()
 		return
 	}
@@ -220,7 +220,7 @@ func (s *service) observeEndpoint(ctx context.Context) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.endpoint != pin || pin.ctx.Err() != nil || ctx.Err() != nil {
+	if s.endpoint != pin || s.state != "running" || s.deadCoreLocked() != "" || pin.ctx.Err() != nil || ctx.Err() != nil {
 		return
 	}
 	if queried {

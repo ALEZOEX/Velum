@@ -293,9 +293,14 @@ func (h *velumWindowsService) Execute(_ []string, requests <-chan svc.ChangeRequ
 				status <- svc.Status{State: svc.StopPending}
 				cancel()
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						logError(err.Error())
+						return false, 1
+					}
 				case <-time.After(12 * time.Second):
 					logError("network engine did not stop within the timeout")
+					return false, 1
 				}
 				logInfo("Velum service stopped")
 				return false, 0

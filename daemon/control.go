@@ -10,8 +10,37 @@ import (
 	"time"
 )
 
-// mu serializes lifecycle mutations, not status reads. JSON snapshots never
-// alias mutable maps/pointers and remain readable during DNS/core startup.
+// The lifecycle gate serializes process and route ownership. The state mutex
+// protects publications and command admission. Owners can take the state
+// mutex, but a caller must release it before waiting for the gate.
+func (s *service) tryLifecycle() bool {
+	s.lifecycleOnce.Do(func() { s.lifecycle = make(chan struct{}, 1) })
+	select {
+	case s.lifecycle <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *service) enterLifecycle(ctx context.Context) error {
+	s.lifecycleOnce.Do(func() { s.lifecycle = make(chan struct{}, 1) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.lifecycle <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			s.leaveLifecycle()
+			return err
+		}
+		return nil
+	}
+}
+
+func (s *service) leaveLifecycle() { <-s.lifecycle }
+
+// JSON snapshots do not alias mutable session state. GET remains responsive
+// even when a publication is already in progress.
 func (s *service) ensureStatusCache() {
 	s.statusOnce.Do(func() { s.mu.Lock(); defer s.mu.Unlock(); s.publishStatusLocked() })
 }
@@ -29,14 +58,17 @@ func (s *service) writeStatus(w http.ResponseWriter) {
 	}
 	_, _ = w.Write(s.statusCache.Load().([]byte))
 }
-func (s *service) controlCurrent(epoch uint64) bool {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
+func (s *service) controlCurrentLocked(epoch uint64) bool {
 	return !s.closing && s.controlGeneration == epoch
 }
+
 func (s *service) beginControl(parent context.Context) (context.Context, uint64, context.CancelFunc) {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beginControlLocked(parent)
+}
+
+func (s *service) beginControlLocked(parent context.Context) (context.Context, uint64, context.CancelFunc) {
 	if s.controlCancel != nil {
 		s.controlCancel()
 	}
@@ -47,25 +79,40 @@ func (s *service) beginControl(parent context.Context) (context.Context, uint64,
 		cancel()
 	}
 	epoch := s.controlGeneration
-	return ctx, epoch, func() { s.finishControl(epoch, cancel) }
-}
-func (s *service) finishControl(epoch uint64, cancel context.CancelFunc) {
-	cancel()
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
-	if s.controlGeneration == epoch {
-		s.controlCancel = nil
+	return ctx, epoch, func() {
+		cancel()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.controlGeneration == epoch {
+			s.controlCancel = nil
+		}
 	}
 }
-func (s *service) cancelControls() {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
-	s.closing = true
-	s.controlGeneration++
-	if s.controlCancel != nil {
-		s.controlCancel()
+
+// Shutdown owns the final teardown even if the client which started a
+// connection has gone away. A bounded unsuccessful stop keeps its handles
+// and the F2 journal for recovery, and returns an error.
+func (s *service) shutdown() error {
+	s.mu.Lock()
+	if !s.closing {
+		s.closing = true
+		s.controlGeneration++
+		if s.controlCancel != nil {
+			s.controlCancel()
+		}
 	}
+	s.mu.Unlock()
+
+	_ = s.enterLifecycle(context.Background())
+	defer s.leaveLifecycle()
+	if s.shutdownComplete {
+		return nil
+	}
+	err := s.stop()
+	s.shutdownComplete = err == nil
+	return err
 }
+
 func (s *service) controlledConnect(ctx context.Context, epoch uint64, req ConnectRequest) error {
 	// Validation and DNS are outside the lifecycle queue. A newer command cancels
 	// this context and its epoch check prevents late results from starting a core.
@@ -96,7 +143,7 @@ func (s *service) controlledConnect(ctx context.Context, epoch uint64, req Conne
 	}
 	if e != nil {
 		s.mu.Lock()
-		if !s.controlCurrent(epoch) || ctx.Err() != nil {
+		if !s.controlCurrentLocked(epoch) || ctx.Err() != nil {
 			e = context.Canceled
 		} else {
 			s.lastError = e.Error()
@@ -115,38 +162,50 @@ func (s *service) controlledConnect(ctx context.Context, epoch uint64, req Conne
 			}
 		}()
 	}
+	if err := s.enterLifecycle(ctx); err != nil {
+		return err
+	}
+	defer s.leaveLifecycle()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.controlCurrent(epoch) || ctx.Err() != nil {
+	if !s.controlCurrentLocked(epoch) || ctx.Err() != nil {
+		s.mu.Unlock()
 		return context.Canceled
 	}
-	previousState, previousCmd, previousRequest := s.state, s.cmd, s.desired
+	previousState, previousCmd := s.state, s.cmd
 	s.state = "connecting"
 	s.publishStatusLocked()
+	s.mu.Unlock()
+
 	req.endpoint = pin
 	req.operationContext = ctx
+	req.operationEpoch = epoch
 	e = s.connectRequest(req)
-	if !s.controlCurrent(epoch) || ctx.Err() != nil {
-		// Candidate validation can be cancelled before it touches the live core.
-		if s.cmd == previousCmd && s.tunCleanupErr == nil {
-			s.state = previousState
-		} else if s.cmd != nil && s.cmd != previousCmd {
-			s.stopCore()
-		}
-		s.desired = previousRequest
-		s.publishStatusLocked()
-		return errors.Join(context.Canceled, s.tunCleanupErr)
+	if e == nil {
+		// connectRequest published the new session under the admission mutex.
+		return nil
 	}
-	if e != nil {
-		if previousCmd != nil && s.cmd == previousCmd {
-			s.state = previousState
-		} else if s.cmd == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if previousCmd != nil && s.cmd == previousCmd && s.state == "connecting" {
+		if failure := s.deadCoreLocked(); failure != "" {
+			s.state, s.lastError = "error", failure
+		} else {
+			s.state = previousState // Failed candidate before teardown.
+		}
+	} else if s.state != "error" {
+		s.state = "disconnected"
+	}
+	if s.controlCurrentLocked(epoch) && ctx.Err() == nil {
+		if s.cmd == nil || s.state != "running" {
 			s.state = "error"
 		}
 		s.lastError = e.Error()
 		s.logs.add("error", e.Error())
 	}
 	s.publishStatusLocked()
+	if ctx.Err() != nil || !s.controlCurrentLocked(epoch) {
+		return errors.Join(context.Canceled, s.tunCleanupErr)
+	}
 	return e
 }
 
@@ -171,43 +230,56 @@ func (s *service) handleControl(w http.ResponseWriter, r *http.Request) bool {
 		s.writeControlError(w, e)
 		return true
 	}
-	ctx, epoch, cancel := s.beginControl(r.Context())
-	defer cancel()
-	if r.URL.Path == "/v1/disconnect" {
-		s.mu.Lock()
-		if !s.controlCurrent(epoch) || ctx.Err() != nil {
-			e = context.Canceled
-		} else {
-			s.state = "disconnecting"
-			s.publishStatusLocked()
-			e = s.stop()
-		}
-		s.publishStatusLocked()
+	s.mu.Lock()
+	if s.closing || r.Context().Err() != nil {
 		s.mu.Unlock()
-	} else {
-		s.mu.Lock()
-		if !s.controlCurrent(epoch) || ctx.Err() != nil {
-			e = context.Canceled
-		} else {
-			// An explicit new connection supersedes any pending crash retry.
-			s.reconnectAt = time.Time{}
+		s.writeControlError(w, context.Canceled)
+		return true
+	}
+	if r.URL.Path == "/v1/reconnect" {
+		if s.desired == nil {
+			s.mu.Unlock()
+			s.writeControlError(w, errors.New("Нет последнего соединения"))
+			return true
 		}
-		if e == nil && r.URL.Path == "/v1/reconnect" {
-			if s.desired == nil {
-				e = errors.New("Нет последнего соединения")
+		req = *s.desired
+	}
+	ctx, epoch, finish := s.beginControlLocked(r.Context())
+	s.reconnectAt = time.Time{} // Explicit commands supersede a pending retry.
+	s.mu.Unlock()
+	defer finish()
+
+	if r.URL.Path == "/v1/disconnect" {
+		e = s.enterLifecycle(ctx)
+		if e == nil {
+			defer s.leaveLifecycle()
+			s.mu.Lock()
+			current := s.controlCurrentLocked(epoch) && ctx.Err() == nil
+			s.mu.Unlock()
+			if current {
+				e = s.stop()
 			} else {
-				req = *s.desired
+				e = context.Canceled
 			}
 		}
-		s.mu.Unlock()
-		if e == nil {
-			e = s.controlledConnect(ctx, epoch, req)
-		}
+	} else {
+		e = s.controlledConnect(ctx, epoch, req)
 	}
 	if e != nil {
 		s.writeControlError(w, e)
+		return true
+	}
+	// A replacement committed after this command must not be returned as
+	// this command's successful result.
+	s.mu.Lock()
+	current := s.controlCurrentLocked(epoch) && ctx.Err() == nil
+	s.publishStatusLocked()
+	snapshot := s.statusCache.Load().([]byte)
+	s.mu.Unlock()
+	if current {
+		_, _ = w.Write(snapshot)
 	} else {
-		s.writeStatus(w)
+		s.writeControlError(w, context.Canceled)
 	}
 	return true
 }
@@ -224,21 +296,19 @@ func (s *service) writeControlError(w http.ResponseWriter, e error) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 func (s *service) automaticReconnect(ctx context.Context, epoch uint64, req ConnectRequest, attempt int) {
-	s.controlMu.Lock()
-	if s.closing || s.controlGeneration != epoch || s.controlCancel != nil {
-		s.controlMu.Unlock()
+	s.mu.Lock()
+	if !s.controlCurrentLocked(epoch) || s.controlCancel != nil || s.reconnectAt.IsZero() {
+		s.mu.Unlock()
 		return
 	}
-	s.controlGeneration++
-	epoch = s.controlGeneration
-	autoCtx, cancel := context.WithCancel(ctx)
-	s.controlCancel = cancel
-	s.controlMu.Unlock()
-	defer s.finishControl(epoch, cancel)
-	e := s.controlledConnect(autoCtx, epoch, req)
+	autoCtx, autoEpoch, finish := s.beginControlLocked(ctx)
+	s.mu.Unlock()
+	defer finish()
+
+	e := s.controlledConnect(autoCtx, autoEpoch, req)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.controlCurrent(epoch) {
+	if !s.controlCurrentLocked(autoEpoch) {
 		return
 	}
 	s.reconnectAttempts = attempt

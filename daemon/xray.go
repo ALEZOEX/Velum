@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
@@ -210,6 +211,10 @@ func validateXrayExecutable(path string) error {
 }
 
 func writeCheckedXray(executable, path string, cfg map[string]any) error {
+	return writeCheckedXrayContext(context.Background(), executable, path, cfg)
+}
+
+func writeCheckedXrayContext(parent context.Context, executable, path string, cfg map[string]any) error {
 	data, e := json.Marshal(cfg)
 	if e != nil {
 		return e
@@ -217,58 +222,80 @@ func writeCheckedXray(executable, path string, cfg map[string]any) error {
 	if e = os.WriteFile(path, data, 0600); e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
-	if exec.CommandContext(ctx, executable, "run", "-test", "-config", path).Run() != nil {
+	check := exec.CommandContext(ctx, executable, "run", "-test", "-config", path)
+	check.WaitDelay = time.Second
+	if check.Run() != nil {
 		return errors.New("Xray отклонил конфигурацию XHTTP; проверьте параметры ссылки")
 	}
 	return nil
 }
 
-func stopProcess(cmd *exec.Cmd, done chan struct{}) {
+func stopProcess(cmd *exec.Cmd, done chan struct{}) error {
 	if cmd == nil {
-		return
+		return nil
 	}
 	select {
 	case <-done:
-		return
+		return nil
 	default:
 	}
 	interruptProcess(cmd)
+	grace := time.NewTimer(4 * time.Second)
+	defer grace.Stop()
 	select {
 	case <-done:
-	case <-time.After(4 * time.Second):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		return nil
+	case <-grace.C:
+	}
+	if cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("не удалось завершить %s: %w", filepath.Base(cmd.Path), err)
 		}
-		<-done
+	}
+	// WaitDelay bounds pipe drain after exit. The kernel may still defer
+	// completing a kill. In that case the caller keeps ownership and retries.
+	killed := time.NewTimer(2 * time.Second)
+	defer killed.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-killed.C:
+		return fmt.Errorf("%s не завершился после принудительной остановки", filepath.Base(cmd.Path))
 	}
 }
 func startCompanion(executable, path, address string, logs *logBuffer) (*exec.Cmd, chan struct{}, error) {
-	return startCompanionContext(context.Background(), executable, path, address, logs)
+	cmd, done, err := startCompanionContext(context.Background(), executable, path, address, logs)
+	if err != nil {
+		return nil, nil, errors.Join(err, stopProcess(cmd, done))
+	}
+	return cmd, done, nil
 }
 func startCompanionContext(ctx context.Context, executable, path, address string, logs *logBuffer) (*exec.Cmd, chan struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	cmd := exec.Command(executable, "run", "-config", path)
 	cmd.Stdout = logs
 	cmd.Stderr = logs
+	cmd.WaitDelay = time.Second
 	configureChild(cmd)
 	if e := cmd.Start(); e != nil {
 		return nil, nil, errors.New("Не удалось запустить Xray")
 	}
-	if e := afterStart(cmd); e != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		logs.add("error", e.Error())
-		return nil, nil, errors.New("Не удалось привязать Xray к задаче службы")
-	}
+	attachErr := afterStart(cmd)
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
+	if attachErr != nil {
+		logs.add("error", attachErr.Error())
+		return cmd, done, errors.New("Не удалось привязать Xray к задаче службы")
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			stopProcess(cmd, done)
-			return nil, nil, ctx.Err()
+			return cmd, done, ctx.Err()
 		case <-done:
 			return nil, nil, errors.New("Xray завершился при запуске; проверьте журнал")
 		default:
@@ -280,6 +307,5 @@ func startCompanionContext(ctx context.Context, executable, path, address string
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	stopProcess(cmd, done)
-	return nil, nil, errors.New("Локальный прокси Xray не запустился")
+	return cmd, done, errors.New("Локальный прокси Xray не запустился")
 }

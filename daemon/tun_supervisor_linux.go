@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -87,37 +86,6 @@ func decodeTUNConfig(path string) (map[string]any, error) {
 	}
 	return cfg, nil
 }
-func awaitTUNCore(ctx context.Context, cfg map[string]any, done <-chan struct{}) error {
-	api := cfg["experimental"].(map[string]any)["clash_api"].(map[string]any)
-	address, _ := api["external_controller"].(string)
-	secret, _ := api["secret"].(string)
-	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
-	defer client.CloseIdleConnections()
-	timer := time.NewTimer(8 * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			return errors.New("TUN core exited before readiness")
-		case <-timer.C:
-			return errors.New("TUN core API readiness timeout")
-		case <-ticker.C:
-			req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+address+"/configs", nil)
-			req.Header.Set("Authorization", "Bearer "+secret)
-			res, e := client.Do(req)
-			if e == nil {
-				res.Body.Close()
-				if res.StatusCode == 200 {
-					return nil
-				}
-			}
-		}
-	}
-}
 func superviseTUN(core, path string) (result error) {
 	// Pdeathsig is tied to the spawning OS thread. Keep that thread alive for
 	// the complete core lifetime; the supervisor itself has no Pdeathsig.
@@ -186,8 +154,12 @@ func superviseTUN(core, path string) (result error) {
 	var cmd *exec.Cmd
 	var done chan struct{}
 	defer func() {
-		if cmd != nil {
-			stopProcess(cmd, done)
+		if stopErr := stopProcess(cmd, done); stopErr != nil {
+			tun.Close()
+			// The child holds FD4 and its TUN FD. Leave its ownership journal
+			// intact for independent recovery after the kernel reaps it.
+			result = errors.Join(result, stopErr)
+			return
 		}
 		tun.Close() // Kernel removes only the nonpersistent interface held by this FD.
 		if cleanup := lease.recover(); cleanup != nil {
@@ -227,7 +199,8 @@ func superviseTUN(core, path string) (result error) {
 	}
 	done = make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
-	if e = awaitTUNCore(ctx, cfg, done); e != nil {
+	api := cfg["experimental"].(map[string]any)["clash_api"].(map[string]any)
+	if e = awaitCoreAPI(ctx, api["external_controller"].(string), api["secret"].(string), done, nil); e != nil {
 		return e
 	}
 	if e = configureTUNDNS(index, in); e != nil {
@@ -248,7 +221,11 @@ func superviseTUN(core, path string) (result error) {
 func unixCloseOnExec(fd int) { syscall.CloseOnExec(fd) }
 
 func startManagedTUN(core, path string, logs io.Writer) (*exec.Cmd, chan struct{}, io.Closer, string, error) {
-	return startManagedTUNContext(context.Background(), core, path, logs)
+	cmd, done, life, iface, err := startManagedTUNContext(context.Background(), core, path, logs)
+	if err != nil {
+		return nil, nil, nil, "", errors.Join(err, stopProcess(cmd, done))
+	}
+	return cmd, done, life, iface, nil
 }
 func startManagedTUNContext(ctx context.Context, core, path string, logs io.Writer) (*exec.Cmd, chan struct{}, io.Closer, string, error) {
 	executable, e := os.Executable()
@@ -291,29 +268,27 @@ func startManagedTUNContext(ctx context.Context, core, path string, logs io.Writ
 		e := json.NewDecoder(io.LimitReader(r, 8192)).Decode(&v)
 		replyCh <- reply{v, e}
 	}()
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
 	select {
 	case res := <-replyCh:
 		if res.e == nil && res.v.Error == "" {
 			return cmd, done, life, res.v.Interface, nil
 		}
-		life.Close()
-		stopProcess(cmd, done)
 		if res.v.Error != "" {
 			e = errors.New(res.v.Error)
 		} else {
 			e = fmt.Errorf("TUN supervisor startup failed: %w", res.e)
 		}
 	case <-ctx.Done():
-		life.Close()
-		stopProcess(cmd, done)
 		e = ctx.Err()
-	case <-time.After(15 * time.Second):
-		life.Close()
-		stopProcess(cmd, done)
+	case <-timer.C:
 		e = errors.New("TUN supervisor startup timed out")
 	}
-	return nil, nil, nil, "", e
+	_ = life.Close()
+	return cmd, done, nil, "", e
 }
+
 func checkTUNWithLease(cfg map[string]any) error {
 	h, e := newTUNReader()
 	if e != nil {

@@ -223,7 +223,6 @@ func TestEndpointCancelledCandidateKeepsExistingConnection(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	oldCore := &exec.Cmd{}
 	oldDone := make(chan struct{})
-	close(oldDone)
 	s := &service{dir: t.TempDir(), core: "/usr/bin/true", tun: true, interfaceName: "lo", cmd: oldCore, done: oldDone, state: "running"}
 	s.tunPreflight = func(map[string]any) error {
 		select {

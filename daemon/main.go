@@ -33,12 +33,15 @@ type ConnectRequest struct {
 	resolvedServer   netip.Addr
 	endpoint         *endpointPin
 	operationContext context.Context
+	operationEpoch   uint64
 	URI              string             `json:"uri"`
 	Exclusions       []string           `json:"exclusions,omitempty"`
 	Settings         ConnectionSettings `json:"settings,omitempty"`
 }
 type service struct {
-	controlMu                                            sync.Mutex
+	lifecycleOnce                                        sync.Once
+	lifecycle                                            chan struct{}
+	shutdownComplete                                     bool
 	controlGeneration                                    uint64
 	controlCancel                                        context.CancelFunc
 	closing                                              bool
@@ -73,79 +76,107 @@ type service struct {
 	logs                                                 logBuffer
 
 	// Defaults to platform recovery + preflight; injectable for tests.
-	tunPreflight func(map[string]any) error
+	tunPreflight   func(map[string]any) error
+	waitForStartup func(context.Context, <-chan struct{}, <-chan struct{}) error
 }
 
-func (s *service) stopCore() {
+// Only the lifecycle owner can stop processes. Publish the transition before
+// waiting, and keep any handles necessary to retry an incomplete cleanup.
+func (s *service) stopCore() error {
+	s.mu.Lock()
 	if s.endpoint != nil {
 		s.endpoint.cancel()
 		s.endpoint = nil
 	}
-	if s.tunLife != nil {
-		// The guardian can remove its endpoint exception as soon as it sees EOF.
-		stopProcess(s.xrayCmd, s.xrayDone)
-		s.xrayCmd, s.xrayDone = nil, nil
-		s.tunLife.Close()
-		s.tunLife = nil
-	}
-	if s.cmd != nil {
-		select {
-		case <-s.done:
-		default:
-			interruptProcess(s.cmd)
-			select {
-			case <-s.done:
-			case <-time.After(4 * time.Second):
-				if s.cmd.Process != nil {
-					_ = s.cmd.Process.Kill()
-				}
-				<-s.done
-			}
-		}
-	}
-	stopProcess(s.xrayCmd, s.xrayDone)
-	s.xrayCmd = nil
-	s.xrayDone = nil
-	if s.dir != "" {
-		_ = os.Remove(filepath.Join(s.dir, "xray.json"))
-	}
-	s.cmd = nil
-	s.tunCleanupErr = nil
-	if s.tunManaged {
-		s.tunCleanupErr = recoverTUN()
-		if s.tunCleanupErr == nil {
-			s.tunManaged = false
-			s.tunActive = false
-		}
-	}
-	s.state = "disconnected"
-	if s.tunCleanupErr != nil {
-		s.state = "error"
-		s.lastError = s.tunCleanupErr.Error()
+	cmd, done, life := s.cmd, s.done, s.tunLife
+	xray, xrayDone := s.xrayCmd, s.xrayDone
+	managed := s.tunManaged
+	transition := s.state
+	if transition != "connecting" {
+		s.state = "disconnecting"
 	}
 	s.verified = false
 	s.latencyMs = nil
+	s.apiAddress, s.apiSecret = "", ""
+	s.publishStatusLocked()
+	s.mu.Unlock()
+
+	if life != nil {
+		// A pending Xray still needs the routes owned by the guardian.
+		if err := stopProcess(xray, xrayDone); err != nil {
+			return s.incompleteStop(err)
+		}
+		xray, xrayDone = nil, nil
+		_ = life.Close()
+		life = nil
+	}
+	processErr := stopProcess(cmd, done)
+	xrayErr := stopProcess(xray, xrayDone)
+	var recoveryErr error
+	if processErr == nil && xrayErr == nil && managed {
+		recoveryErr = recoverTUN()
+	}
+	if xrayErr == nil && s.dir != "" {
+		_ = os.Remove(filepath.Join(s.dir, "xray.json"))
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tunLife = life
+	if processErr == nil {
+		s.cmd, s.done = nil, nil
+	}
+	if xrayErr == nil {
+		s.xrayCmd, s.xrayDone = nil, nil
+	}
+	s.tunCleanupErr = errors.Join(processErr, xrayErr, recoveryErr)
+	if s.tunCleanupErr == nil {
+		s.tunManaged, s.tunActive = false, false
+		s.state = "disconnected"
+		if transition == "connecting" {
+			s.state = transition
+		}
+	} else {
+		s.state = "error"
+		s.lastError = s.tunCleanupErr.Error()
+	}
 	s.connectedAt = time.Time{}
-	s.apiAddress = ""
-	s.apiSecret = ""
-	s.activeInterface = ""
+	s.activeInterface, s.activeProfile = "", ""
+	s.publishStatusLocked()
+	return s.tunCleanupErr
 }
+
+func (s *service) incompleteStop(err error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tunCleanupErr = err
+	s.state, s.lastError = "error", err.Error()
+	s.publishStatusLocked()
+	return err
+}
+
 func (s *service) stop() error {
+	s.mu.Lock()
 	s.desired = nil
 	s.reconnectAt = time.Time{}
 	s.reconnectAttempts = 0
-	s.stopCore()
-	if s.tunCleanupErr != nil {
-		return s.tunCleanupErr
+	s.state = "disconnecting"
+	s.publishStatusLocked()
+	s.mu.Unlock()
+	if err := s.stopCore(); err != nil {
+		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastError = ""
 	s.logs.add("info", "Соединение остановлено")
+	s.publishStatusLocked()
 	return nil
 }
 func (s *service) connect(uri string, exclusions ...string) error {
 	return s.connectRequest(ConnectRequest{URI: uri, Exclusions: exclusions})
 }
-func (s *service) connectRequest(req ConnectRequest) error {
+func (s *service) connectRequest(req ConnectRequest) (result error) {
 	if err := req.Settings.validate(s.tun); err != nil {
 		return err
 	}
@@ -167,6 +198,12 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		}
 		pinCtx, cancel := context.WithCancel(context.Background())
 		req.endpoint = &endpointPin{Host: ip.String(), IP: ip, Answers: []netip.Addr{ip}, ctx: pinCtx, cancel: cancel}
+		defer func() {
+			if result != nil {
+				cancel()
+			}
+		}()
+		req.resolvedServer = ip
 	}
 	opCtx := req.operationContext
 	if opCtx == nil {
@@ -286,13 +323,15 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	defer os.Remove(candidate)
 	ctx, cancel := context.WithTimeout(opCtx, 8*time.Second)
 	defer cancel()
-	if err = exec.CommandContext(ctx, s.core, "check", "-c", candidate).Run(); err != nil {
+	check := exec.CommandContext(ctx, s.core, "check", "-c", candidate)
+	check.WaitDelay = time.Second
+	if err = check.Run(); err != nil {
 		return errors.New("sing-box отклонил конфигурацию; проверьте протокол, параметры и сборку ядра")
 	}
 	xrayCandidate := filepath.Join(s.dir, "candidate-xray.json")
 	if companionConfig != nil {
 		defer os.Remove(xrayCandidate)
-		if err = writeCheckedXray(s.xray, xrayCandidate, companionConfig); err != nil {
+		if err = writeCheckedXrayContext(opCtx, s.xray, xrayCandidate, companionConfig); err != nil {
 			return err
 		}
 	}
@@ -310,9 +349,11 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	if err := opCtx.Err(); err != nil {
 		return err
 	}
-	s.stopCore()
-	if s.tunCleanupErr != nil {
-		return s.tunCleanupErr
+	if err = s.stopCore(); err != nil {
+		return err
+	}
+	if err = opCtx.Err(); err != nil {
+		return err
 	}
 	// Recheck after teardown and immediately before any new child starts.
 	// Only a validated journal permits recovery; preflight refuses unowned resources.
@@ -333,7 +374,7 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	success := false
 	defer func() {
 		if !success {
-			s.stopCore()
+			result = errors.Join(result, s.stopCore())
 		}
 	}()
 	managedTUN := tun && runtime.GOOS == "linux"
@@ -345,8 +386,10 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		if err := os.Rename(xrayCandidate, xrayPath); err != nil {
 			return err
 		}
-		var startErr error
-		s.xrayCmd, s.xrayDone, startErr = startCompanionContext(opCtx, s.xray, xrayPath, bridgeAddress, &s.logs)
+		child, exited, startErr := startCompanionContext(opCtx, s.xray, xrayPath, bridgeAddress, &s.logs)
+		s.mu.Lock()
+		s.xrayCmd, s.xrayDone = child, exited
+		s.mu.Unlock()
 		return startErr
 	}
 	if companionConfig != nil && !managedTUN {
@@ -357,88 +400,128 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	var done chan struct{}
 	if managedTUN {
 		var life io.Closer
+		s.mu.Lock()
 		s.tunManaged = true
+		s.mu.Unlock()
 		cmd, done, life, activeInterface, err = startManagedTUNContext(opCtx, s.core, path, &s.logs)
+		s.mu.Lock()
+		s.cmd, s.done, s.tunLife = cmd, done, life
+		s.mu.Unlock()
 		if err != nil {
-			s.stopCore()
-			return errors.Join(err, s.tunCleanupErr)
+			return err
 		}
-		s.tunLife = life
 	} else {
 		cmd.Stdout = &s.logs
 		cmd.Stderr = &s.logs
+		cmd.WaitDelay = time.Second
 		configureChild(cmd)
 		if err = cmd.Start(); err != nil {
 			return errors.New("Не удалось запустить sing-box")
 		}
-		if err = afterStart(cmd); err != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			s.logs.add("error", err.Error())
+		done = make(chan struct{})
+		s.mu.Lock()
+		s.cmd, s.done = cmd, done
+		s.tunActive = tun
+		s.mu.Unlock()
+		attachErr := afterStart(cmd)
+		go func() { _ = cmd.Wait(); close(done) }()
+		if attachErr != nil {
+			s.logs.add("error", attachErr.Error())
 			return errors.New("Не удалось привязать sing-box к задаче службы")
 		}
-		s.cmd = cmd
-		s.done = make(chan struct{})
-		done = s.done
-		go func() { _ = cmd.Wait(); close(done) }()
 	}
-	s.cmd = cmd
-	s.done = done
 	if managedTUN && companionConfig != nil {
 		// A ready guardian has verified the physical route and installed F2 rules.
 		if err = startXray(); err != nil {
 			return err
 		}
 	}
-	select {
-	case <-done:
-		s.cmd = nil
-		s.state = "error"
-		return errors.New("Ядро завершилось при запуске; проверьте журнал, права TUN и занятость портов")
-	case <-opCtx.Done():
-		return opCtx.Err()
-	case <-time.After(500 * time.Millisecond):
-		if s.xrayCmd != nil {
-			select {
-			case <-s.xrayDone:
-				return errors.New("Xray завершился при запуске")
-			default:
+	if s.waitForStartup != nil {
+		err = s.waitForStartup(opCtx, done, s.xrayDone)
+	} else if !managedTUN {
+		// Linux's guardian has already checked the API. For direct child
+		// starts, a live PID alone does not prove the listener is ready.
+		err = awaitCoreAPI(opCtx, address, secret, done, s.xrayDone)
+	}
+	if err != nil {
+		return err
+	}
+	if req.endpoint != nil {
+		req.endpoint.Interface = activeInterface
+		req.endpoint.InterfaceSignature, _ = endpointInterfaceSignature(activeInterface)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if opCtx.Err() != nil || req.operationEpoch != 0 && !s.controlCurrentLocked(req.operationEpoch) {
+		return context.Canceled
+	}
+	if failure := s.deadCoreLocked(); failure != "" {
+		return errors.New(failure)
+	}
+	s.state = "running"
+	s.lastError = ""
+	s.tunActive = tun
+	s.activeInterface = activeInterface
+	s.connectedAt = time.Now().UTC()
+	s.apiAddress = address
+	s.apiSecret = secret
+	s.proxyPort = req.Settings.ProxyPort
+	if s.proxyPort == 0 {
+		s.proxyPort = 2080
+	}
+	digest := sha256.Sum256([]byte(req.URI))
+	s.activeProfile = hex.EncodeToString(digest[:8])
+	s.endpoint = req.endpoint
+	req.endpoint = nil
+	req.operationContext = nil
+	req.operationEpoch = 0
+	req.resolvedServer = netip.Addr{}
+	s.desired = &req
+	s.reconnectAt = time.Time{}
+	s.reconnectAttempts = 0
+	s.sampleAt = time.Time{}
+	s.uploadTotal = nil
+	s.downloadTotal = nil
+	s.uploadRate = nil
+	s.downloadRate = nil
+	success = true
+	s.logs.add("info", "Сетевое ядро запущено")
+	s.publishStatusLocked()
+	return nil
+}
+
+func awaitCoreAPI(parent context.Context, address, secret string, coreDone, companionDone <-chan struct{}) error {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil}}
+	defer client.CloseIdleConnections()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-coreDone:
+			return errors.New("Ядро завершилось при запуске")
+		case <-companionDone:
+			return errors.New("Xray завершился при запуске")
+		case <-ctx.Done():
+			return fmt.Errorf("API ядра не готов: %w", ctx.Err())
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, "GET", "http://"+address+"/configs", nil)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Authorization", "Bearer "+secret)
+			res, err := client.Do(req)
+			if err == nil {
+				res.Body.Close()
+				if res.StatusCode == http.StatusOK {
+					return nil
+				}
 			}
 		}
-		s.state = "running"
-		s.lastError = ""
-		s.tunActive = tun
-		s.activeInterface = activeInterface
-		s.connectedAt = time.Now().UTC()
-		s.apiAddress = address
-		s.apiSecret = secret
-		s.proxyPort = req.Settings.ProxyPort
-		if s.proxyPort == 0 {
-			s.proxyPort = 2080
-		}
-		digest := sha256.Sum256([]byte(req.URI))
-		s.activeProfile = hex.EncodeToString(digest[:8])
-		if req.endpoint != nil {
-			s.endpoint = req.endpoint
-			s.endpoint.Interface = activeInterface
-			s.endpoint.InterfaceSignature, _ = endpointInterfaceSignature(activeInterface)
-		}
-		req.endpoint = nil
-		req.operationContext = nil
-		req.resolvedServer = netip.Addr{}
-		s.desired = &req
-		s.reconnectAt = time.Time{}
-		s.reconnectAttempts = 0
-		s.sampleAt = time.Time{}
-		s.uploadTotal = nil
-		s.downloadTotal = nil
-		s.uploadRate = nil
-		s.downloadRate = nil
-		success = true
-		s.logs.add("info", "Сетевое ядро запущено")
-		return nil
 	}
 }
+
 func freeAddress() (string, error) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -505,7 +588,7 @@ func (s *service) refreshStatsContext(ctx context.Context) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != "running" || s.apiSecret != secret {
+	if s.state != "running" || s.apiSecret != secret || s.deadCoreLocked() != "" {
 		return
 	}
 	now := time.Now()
@@ -522,6 +605,7 @@ func (s *service) refreshStatsContext(ctx context.Context) {
 	s.uploadRate = &up
 	s.downloadRate = &down
 	s.sampleAt = now
+	s.publishStatusLocked()
 }
 func (s *service) check() error { return s.checkContext(context.Background()) }
 func (s *service) checkContext(ctx context.Context) error {
@@ -530,18 +614,44 @@ func (s *service) checkContext(ctx context.Context) error {
 		s.mu.Unlock()
 		return errors.New("Сначала подключите сервер")
 	}
+	if failure := s.deadCoreLocked(); failure != "" {
+		s.publishStatusLocked()
+		s.mu.Unlock()
+		return errors.New(failure)
+	}
 	s.verified = false
 	s.latencyMs = nil
 	address, secret := s.apiAddress, s.apiSecret
+	done, companionDone := s.done, s.xrayDone
+	s.publishStatusLocked()
 	s.mu.Unlock()
+
+	checkCtx, cancel := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-done:
+			cancel()
+		case <-companionDone:
+			cancel()
+		case <-checkCtx.Done():
+		}
+	}()
+	defer func() { cancel(); <-watchDone }()
 	var result struct {
 		Delay int64 `json:"delay"`
 	}
-	err := coreRequest(ctx, address, secret, "/proxies/proxy/delay?timeout=8000&url="+url.QueryEscape("https://example.com"), &result)
+	err := coreRequest(checkCtx, address, secret, "/proxies/proxy/delay?timeout=8000&url="+url.QueryEscape("https://example.com"), &result)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != "running" || s.apiSecret != secret {
+	if s.state != "running" || s.apiSecret != secret || ctx.Err() != nil {
 		return context.Canceled
+	}
+	if failure := s.deadCoreLocked(); failure != "" {
+		s.verified, s.latencyMs = false, nil
+		s.publishStatusLocked()
+		return errors.New(failure)
 	}
 	defer s.publishStatusLocked()
 	if err != nil {
@@ -555,54 +665,76 @@ func (s *service) checkContext(ctx context.Context) error {
 	s.logs.add("info", "HTTPS через выбранный сервер проверен")
 	return nil
 }
-func (s *service) inspectProcess() {
-	message := ""
+func (s *service) deadCoreLocked() string {
 	if s.xrayCmd != nil {
 		select {
 		case <-s.xrayDone:
-			message = "Ядро Xray неожиданно завершилось"
+			return "Ядро Xray неожиданно завершилось"
 		default:
 		}
 	}
 	if s.cmd != nil {
 		select {
 		case <-s.done:
-			message = "Сетевое ядро неожиданно завершилось"
+			return "Сетевое ядро неожиданно завершилось"
 		default:
 		}
 	}
-	if message != "" {
-		s.stopCore()
-		if s.tunCleanupErr != nil {
-			message = errors.Join(errors.New(message), s.tunCleanupErr).Error()
-		}
-		s.state = "error"
-		s.lastError = message
-		s.logs.add("error", message)
-		s.reconnectAt = time.Now().Add(2 * time.Second)
-	}
+	return ""
 }
-func (s *service) inspectInterface() {
-	// The endpoint observer retains protection and requests explicit reconnect.
-	if s.endpoint != nil {
+
+func (s *service) inspectProcess() {
+	s.inspectSession(false)
+}
+
+// A monitor tick never waits for a foreground lifecycle operation. The
+// identity check after interface lookup prevents a stale tick from stopping a
+// replacement session.
+func (s *service) inspectSession(checkInterface bool) {
+	s.mu.Lock()
+	cmd := s.cmd
+	iface := ""
+	if checkInterface && s.state == "running" && s.endpoint == nil {
+		iface = s.activeInterface
+	}
+	s.mu.Unlock()
+	var missingInterface bool
+	if iface != "" {
+		_, err := net.InterfaceByName(iface)
+		missingInterface = err != nil
+	}
+	if !s.tryLifecycle() {
 		return
 	}
-	if s.state != "running" || s.activeInterface == "" {
+	defer s.leaveLifecycle()
+	s.mu.Lock()
+	if s.closing || s.cmd != cmd {
+		s.mu.Unlock()
 		return
 	}
-	if _, err := net.InterfaceByName(s.activeInterface); err == nil {
+	message := s.deadCoreLocked()
+	if message == "" && missingInterface && s.state == "running" {
+		message = fmt.Sprintf("Исходящий интерфейс %s больше не доступен", iface)
+	}
+	if message == "" {
+		s.mu.Unlock()
 		return
 	}
-	message := fmt.Sprintf("Исходящий интерфейс %s больше не доступен", s.activeInterface)
-	s.stopCore()
-	if s.tunCleanupErr != nil {
-		message = errors.Join(errors.New(message), s.tunCleanupErr).Error()
+	s.state, s.lastError = "error", message
+	s.verified = false
+	s.publishStatusLocked()
+	s.mu.Unlock()
+	if err := s.stopCore(); err != nil {
+		message = errors.Join(errors.New(message), err).Error()
 	}
-	s.state = "error"
-	s.lastError = message
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state, s.lastError = "error", message
 	s.logs.add("error", message)
 	s.reconnectAt = time.Now().Add(2 * time.Second)
+	s.publishStatusLocked()
 }
+
 func (s *service) monitor(ctx context.Context) {
 	s.ensureStatusCache()
 	observerCtx, stopObserver := context.WithCancel(ctx)
@@ -629,24 +761,21 @@ func (s *service) monitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		s.inspectSession(true)
 		s.mu.Lock()
 		if ctx.Err() != nil {
 			s.mu.Unlock()
 			return
 		}
-		s.inspectProcess()
-		s.inspectInterface()
 		var retry *ConnectRequest
 		attempt, epoch := 0, uint64(0)
 		if s.cmd == nil && s.desired != nil && s.desired.Settings.Reconnect && !s.reconnectAt.IsZero() && !time.Now().Before(s.reconnectAt) && s.reconnectAttempts < 5 {
 			request := *s.desired
 			attempt = s.reconnectAttempts + 1
-			s.controlMu.Lock()
 			if !s.closing && s.controlCancel == nil {
 				retry = &request
 				epoch = s.controlGeneration
 			}
-			s.controlMu.Unlock()
 		}
 		if s.cmd != nil && s.state == "running" && time.Since(s.connectedAt) >= 30*time.Second {
 			s.reconnectAttempts = 0
@@ -662,6 +791,8 @@ func (s *service) monitor(ctx context.Context) {
 }
 func (s *service) status() map[string]any {
 	s.inspectProcess()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.statusView()
 }
 func (s *service) statusView() map[string]any {
@@ -683,32 +814,35 @@ func (s *service) statusView() map[string]any {
 	if s.xrayCmd != nil {
 		engine = "sing-box+xray"
 	}
+	state, verified, latency := s.state, s.verified, s.latencyMs
+	message := s.lastError
+	if failure := s.deadCoreLocked(); state == "running" && failure != "" {
+		state, verified, latency, message = "error", false, nil, failure
+	}
+	if state != "running" {
+		verified, latency = false, nil
+	}
 	engineState := "stopped"
-	switch s.state {
+	switch state {
 	case "running":
 		engineState = "running"
 	case "error":
 		engineState = "error"
 	}
-	message := s.lastError
 	if message == "" && s.endpoint != nil {
 		message = s.endpoint.Message
 	}
-	return map[string]any{"endpoint": s.endpoint.status(), "state": s.state, "error": message, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine, "engineState": engineState, "serviceMode": s.serviceMode}
+	return map[string]any{"endpoint": s.endpoint.status(), "state": state, "error": message, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": verified, "latencyMs": latency, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine, "engineState": engineState, "serviceMode": s.serviceMode}
 }
-func probe(uri string) map[string]any {
-	probeURI := uri
+func probeContext(parent context.Context, uri string) map[string]any {
 	if isXHTTP(uri) {
-		if _, err := xrayConfig(uri, "127.0.0.1:12345", "validation-only", ""); err != nil {
+		// Validate the companion configuration without resolving it. The probe's
+		// dialer does DNS once with the same request context and TCP deadline.
+		if _, err := xrayConfigPinned(uri, "127.0.0.1:12345", "validation-only", "", netip.IPv4Unspecified()); err != nil {
 			return map[string]any{"ok": false, "error": err.Error(), "kind": "tcp", "latencyMs": nil}
 		}
-		u, _ := url.Parse(uri)
-		q := u.Query()
-		q.Set("type", "tcp")
-		u.RawQuery = q.Encode()
-		probeURI = u.String()
 	}
-	out, err := outbound(probeURI)
+	out, err := endpointOutbound(uri)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "kind": "tcp", "latencyMs": nil}
 	}
@@ -716,7 +850,7 @@ func probe(uri string) map[string]any {
 		return map[string]any{"ok": false, "error": "TCP-проверка неприменима к UDP-протоколу Hysteria 2; используйте проверку соединения", "kind": "tcp", "latencyMs": nil}
 	}
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 4*time.Second)
 	defer cancel()
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(out["server"].(string), strconv.Itoa(out["server_port"].(int))))
@@ -726,6 +860,7 @@ func probe(uri string) map[string]any {
 	_ = conn.Close()
 	return map[string]any{"ok": true, "error": "", "kind": "tcp", "latencyMs": time.Since(start).Milliseconds()}
 }
+
 func (s *service) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -747,7 +882,7 @@ func (s *service) handler(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(probe(req.URI))
+		_ = json.NewEncoder(w).Encode(probeContext(r.Context(), req.URI))
 		return
 	}
 	if s.handleControl(w, r) {
@@ -903,19 +1038,52 @@ func prepareDaemon(cfg daemonConfig) (*daemonRuntime, error) {
 func (d *daemonRuntime) serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Admission and accounting use their own short lock. No service code
+	// runs under it, and every accepted handler is joined before dir removal.
+	var admission sync.Mutex
+	var handlers sync.WaitGroup
+	accepting := true
+	handler := d.server.Handler
+	d.server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admission.Lock()
+		if !accepting || ctx.Err() != nil {
+			admission.Unlock()
+			http.Error(w, "Velum is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		handlers.Add(1)
+		admission.Unlock()
+		defer handlers.Done()
+		handler.ServeHTTP(w, r)
+	})
+	d.server.BaseContext = func(net.Listener) context.Context { return ctx }
+
 	monitorDone := make(chan struct{})
 	go func() { defer close(monitorDone); d.svc.monitor(ctx) }()
-	go func() { <-ctx.Done(); _ = d.server.Close() }()
+	serverClosed := make(chan struct{})
+	go func() {
+		defer close(serverClosed)
+		<-ctx.Done()
+		_ = d.server.Close()
+	}()
+
 	err := d.server.Serve(d.listener)
+	admission.Lock()
+	accepting = false
+	admission.Unlock()
 	cancel()
-	d.svc.cancelControls()
 	d.svc.mu.Lock()
 	tunWasActive := d.svc.tunActive
-	stopErr := d.svc.stop()
 	d.svc.mu.Unlock()
+	stopErr := d.svc.shutdown()
+	<-serverClosed
+	handlers.Wait()
 	<-monitorDone
-	cleanupNetworkState(tunWasActive)
-	_ = os.RemoveAll(d.dir)
+	if stopErr == nil {
+		cleanupNetworkState(tunWasActive)
+		_ = os.RemoveAll(d.dir)
+	}
 	if err != nil && err != http.ErrServerClosed {
 		return errors.Join(err, stopErr)
 	}
