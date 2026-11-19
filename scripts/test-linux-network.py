@@ -177,10 +177,10 @@ def peer(folder):
         servers.append(dns)
         threading.Thread(target=dns.serve_forever, daemon=True).start()
         cfg = {'log': {'level': 'info'}, 'inbounds': [
-            {'type': 'hysteria2', 'listen': '198.18.0.2', 'listen_port': 8443, 'users': [{'password': 'velum-local-test'}], 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}},
+            {'type': 'hysteria2', 'listen': os.environ.get('VELUM_TEST_ENDPOINT_LISTEN', '198.18.0.2'), 'listen_port': 8443, 'users': [{'password': 'velum-local-test'}], 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}},
             {'type': 'http', 'listen': '127.0.0.1', 'listen_port': 9443, 'tls': {'enabled': True, 'certificate_path': str(folder / 'cert.pem'), 'key_path': str(folder / 'key.pem')}}
         ], 'outbounds': [{'type': 'direct'}]}
-        cfg['inbounds'].append({'type': 'vless', 'listen': '198.18.0.2', 'listen_port': 8444, 'users': [{'uuid': '00000000-0000-4000-8000-000000000001', 'flow': 'xtls-rprx-vision'}], 'tls': {'enabled': True, 'server_name': 'localhost', 'reality': {'enabled': True, 'private_key': (folder / 'reality-private').read_text(), 'short_id': ['abcd'], 'handshake': {'server': '127.0.0.1', 'server_port': 9443}}}})
+        cfg['inbounds'].append({'type': 'vless', 'listen': os.environ.get('VELUM_TEST_ENDPOINT_LISTEN', '198.18.0.2'), 'listen_port': 8444, 'users': [{'uuid': '00000000-0000-4000-8000-000000000001', 'flow': 'xtls-rprx-vision'}], 'tls': {'enabled': True, 'server_name': 'localhost', 'reality': {'enabled': True, 'private_key': (folder / 'reality-private').read_text(), 'short_id': ['abcd'], 'handshake': {'server': '127.0.0.1', 'server_port': 9443}}}})
         path = folder / 'server.json'
         path.write_text(json.dumps(cfg))
         with (folder / 'server.log').open('w') as log:
@@ -191,7 +191,7 @@ def peer(folder):
                 raise RuntimeError((folder / 'server.log').read_text())
             xray_cfg = {
                 'log': {'loglevel': 'debug'},
-                'inbounds': [{'listen': '198.18.0.2', 'port': 8445, 'protocol': 'vless',
+                'inbounds': [{'listen': os.environ.get('VELUM_TEST_ENDPOINT_LISTEN', '198.18.0.2'), 'port': 8445, 'protocol': 'vless',
                     'settings': {'clients': [{'id': '00000000-0000-4000-8000-000000000001'}], 'decryption': 'none'},
                     'streamSettings': {'network': 'xhttp', 'security': 'reality',
                         'realitySettings': {'show': True, 'dest': '127.0.0.1:9443', 'serverNames': ['localhost'],
