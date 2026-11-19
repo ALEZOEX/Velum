@@ -250,17 +250,23 @@ func (s *service) handleControl(w http.ResponseWriter, r *http.Request) bool {
 	defer finish()
 
 	if r.URL.Path == "/v1/disconnect" {
+		var stopped []byte
 		e = s.enterLifecycle(ctx)
 		if e == nil {
-			defer s.leaveLifecycle()
 			s.mu.Lock()
 			current := s.controlCurrentLocked(epoch) && ctx.Err() == nil
 			s.mu.Unlock()
 			if current {
 				e = s.stop()
+				stopped = s.statusCache.Load().([]byte)
 			} else {
 				e = context.Canceled
 			}
+			s.leaveLifecycle()
+		}
+		if e == nil {
+			_, _ = w.Write(stopped)
+			return true
 		}
 	} else {
 		e = s.controlledConnect(ctx, epoch, req)
