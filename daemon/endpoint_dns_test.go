@@ -215,3 +215,24 @@ func TestEndpointDNSCNAMEAndOwnerValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestEndpointDNSRejectsInvalidTCPReply(t *testing.T) {
+	for _, field := range []string{"opcode", "extra question"} {
+		t.Run(field, func(t *testing.T) {
+			server := endpointDNSServer(t, func(q dnsmessage.Message, tcp bool) []byte {
+				r := endpointDNSReply(q, []netip.Addr{netip.MustParseAddr("192.0.2.4")}, 1)
+				if !tcp {
+					r.Truncated = true
+				} else if field == "opcode" {
+					r.OpCode = 2
+				} else {
+					r.Questions = append(r.Questions, q.Questions[0])
+				}
+				return packEndpointReply(t, r)
+			})
+			if _, err := lookupEndpointServer(context.Background(), server, "endpoint.example."); err == nil {
+				t.Fatal("malformed reply supplied a transport pin")
+			}
+		})
+	}
+}

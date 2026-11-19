@@ -30,10 +30,7 @@ func lookupEndpointDNS(ctx context.Context, host string) (endpointAnswer, error)
 	if ip, e := netip.ParseAddr(host); e == nil {
 		return endpointAnswer{IPs: []netip.Addr{ip.Unmap()}}, nil
 	}
-	if data, e := os.ReadFile("/etc/hosts"); e == nil {
-		if len(data) > 1<<20 {
-			return endpointAnswer{}, errors.New("endpoint hosts file exceeds limit")
-		}
+	if data, e := readResolverFile("/etc/hosts", 1<<20); e == nil {
 		var ips []netip.Addr
 		for _, line := range strings.Split(string(data), "\n") {
 			fields := strings.Fields(strings.SplitN(line, "#", 2)[0])
@@ -54,13 +51,12 @@ func lookupEndpointDNS(ctx context.Context, host string) (endpointAnswer, error)
 		if len(ips) > 0 {
 			return endpointAnswer{IPs: sortEndpointIPs(ips), TTL: 30 * time.Second}, nil
 		}
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return endpointAnswer{}, e
 	}
-	data, e := os.ReadFile("/etc/resolv.conf")
+	data, e := readResolverFile("/etc/resolv.conf", 65536)
 	if e != nil {
 		return endpointAnswer{}, fmt.Errorf("endpoint DNS config: %w", e)
-	}
-	if len(data) > 65536 {
-		return endpointAnswer{}, errors.New("endpoint resolver config exceeds limit")
 	}
 	var servers, search []string
 	ndots := 1
@@ -120,6 +116,19 @@ func lookupEndpointDNS(ctx context.Context, host string) (endpointAnswer, error)
 	}
 	return endpointAnswer{}, fmt.Errorf("endpoint DNS: %w", errors.Join(failures...))
 }
+func readResolverFile(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("resolver file %s exceeds %d bytes", path, limit)
+	}
+	return data, err
+}
+
 func sortEndpointIPs(ips []netip.Addr) []netip.Addr {
 	set := map[netip.Addr]bool{}
 	for _, ip := range ips {
@@ -271,7 +280,7 @@ func endpointDNSExchange(ctx context.Context, server string, request dnsmessage.
 				var parser dnsmessage.Parser
 				header, parseErr := parser.Start(buffer[:n])
 				q, qerr := parser.Question()
-				if parseErr != nil || qerr != nil || !header.Response || header.ID != request.ID || len(request.Questions) != 1 || q.Type != request.Questions[0].Type || q.Class != request.Questions[0].Class || !strings.EqualFold(q.Name.String(), request.Questions[0].Name.String()) {
+				if parseErr != nil || qerr != nil || !header.Response || header.OpCode != request.OpCode || binary.BigEndian.Uint16(buffer[4:6]) != 1 || header.ID != request.ID || len(request.Questions) != 1 || q.Type != request.Questions[0].Type || q.Class != request.Questions[0].Class || !strings.EqualFold(q.Name.String(), request.Questions[0].Name.String()) {
 					if network == "tcp" {
 						e = errors.New("invalid DNS response identity")
 						break
