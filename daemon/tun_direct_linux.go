@@ -89,3 +89,45 @@ func tunUplinkSources(iface string) ([]netip.Addr, error) {
 	}
 	return sources, nil
 }
+
+// The generated configuration pins exactly one host for the whole session. A
+// broad or ambiguous exclusion must be rejected before creating the interface.
+func tunPinnedEndpoint(in map[string]any) (netip.Addr, error) {
+	prefixes, err := tunAddresses(in, "route_exclude_address")
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if len(prefixes) != 1 {
+		return netip.Addr{}, fmt.Errorf("Linux TUN requires exactly one pinned remote endpoint, got %d", len(prefixes))
+	}
+	p := prefixes[0]
+	ip := p.Addr()
+	if p.Bits() != ip.BitLen() || ip.Is4In6() {
+		return netip.Addr{}, fmt.Errorf("Linux TUN endpoint must be a canonical host prefix: %s", p)
+	}
+	if _, err := safeEndpointIPs([]netip.Addr{ip}); err != nil {
+		return netip.Addr{}, err
+	}
+	return ip, nil
+}
+
+// UID 0 covers the daemon route probe, core, Xray and kernel reverse-path
+// lookup. Bind-to-device in each transport also pins its actual socket. All
+// non-root traffic to this IP remains subject to ordinary application policy.
+func tunEndpointTransportRules(ip netip.Addr, mark uint32) []tunObject {
+	family := unix.AF_INET
+	if ip.Is6() {
+		family = unix.AF_INET6
+	}
+	var rules []tunObject
+	for _, action := range []int{unix.FR_ACT_TO_TBL, unix.FR_ACT_UNREACHABLE} {
+		table := 0
+		if action == unix.FR_ACT_TO_TBL {
+			table = unix.RT_TABLE_MAIN
+		}
+		rule := tunPrefix(tunRule(family, linuxTUNRuleStart, table, action, mark), netip.PrefixFrom(ip, ip.BitLen()), false)
+		rule = tunSetAttr(rule, unix.FRA_UID_RANGE, make([]byte, 8))
+		rules = append(rules, rule)
+	}
+	return rules
+}

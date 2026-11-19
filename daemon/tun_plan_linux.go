@@ -123,6 +123,15 @@ func tunPlan(in map[string]any, index int, mark uint32) ([]tunObject, error) {
 		for _, prefix := range ranges {
 			objects = append(objects, tunRoute(prefix, index, mark))
 		}
+		// The transport-specific rules already bypass the TUN for the daemon's
+		// UID. Fill the former host-wide exception for other UIDs. Keep the
+		// split routes above: an aggregated /0 is suppressed by the early
+		// table lookup and would change precedence for unrelated traffic.
+		for _, endpoint := range excludes {
+			if endpoint.Addr().Is4() == (family == unix.AF_INET) {
+				objects = append(objects, tunRoute(endpoint, index, mark))
+			}
+		}
 		var rules []tunObject
 		lookup := func(priority, table int) tunObject { return tunRule(family, priority, table, unix.FR_ACT_TO_TBL, mark) }
 		goTo := func(priority int) tunObject {

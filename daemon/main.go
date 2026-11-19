@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -23,16 +24,28 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type ConnectRequest struct {
-	URI        string             `json:"uri"`
-	Exclusions []string           `json:"exclusions,omitempty"`
-	Settings   ConnectionSettings `json:"settings,omitempty"`
+	resolvedServer   netip.Addr
+	endpoint         *endpointPin
+	operationContext context.Context
+	URI              string             `json:"uri"`
+	Exclusions       []string           `json:"exclusions,omitempty"`
+	Settings         ConnectionSettings `json:"settings,omitempty"`
 }
 type service struct {
+	controlMu                                            sync.Mutex
+	controlGeneration                                    uint64
+	controlCancel                                        context.CancelFunc
+	closing                                              bool
+	statusOnce                                           sync.Once
+	statusCache                                          atomic.Value
+	endpoint                                             *endpointPin
+	endpointLookup                                       endpointLookupFunc
 	mu                                                   sync.Mutex
 	cmd                                                  *exec.Cmd
 	xrayCmd                                              *exec.Cmd
@@ -64,7 +77,14 @@ type service struct {
 }
 
 func (s *service) stopCore() {
+	if s.endpoint != nil {
+		s.endpoint.cancel()
+		s.endpoint = nil
+	}
 	if s.tunLife != nil {
+		// The guardian can remove its endpoint exception as soon as it sees EOF.
+		stopProcess(s.xrayCmd, s.xrayDone)
+		s.xrayCmd, s.xrayDone = nil, nil
 		s.tunLife.Close()
 		s.tunLife = nil
 	}
@@ -112,6 +132,7 @@ func (s *service) stopCore() {
 }
 func (s *service) stop() error {
 	s.desired = nil
+	s.reconnectAt = time.Time{}
 	s.reconnectAttempts = 0
 	s.stopCore()
 	if s.tunCleanupErr != nil {
@@ -132,12 +153,34 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	if req.Settings.Mode != "" {
 		tun = req.Settings.Mode == "tun"
 	}
+	if managedEndpoint(s.tun, req) && req.endpoint == nil {
+		out, e := endpointOutbound(req.URI)
+		if e != nil {
+			return e
+		}
+		ip, e := netip.ParseAddr(out["server"].(string))
+		if e != nil {
+			return errors.New("Linux TUN endpoint requires preparation outside lifecycle lock")
+		}
+		if _, e = safeEndpointIPs([]netip.Addr{ip}); e != nil {
+			return e
+		}
+		pinCtx, cancel := context.WithCancel(context.Background())
+		req.endpoint = &endpointPin{Host: ip.String(), IP: ip, Answers: []netip.Addr{ip}, ctx: pinCtx, cancel: cancel}
+	}
+	opCtx := req.operationContext
+	if opCtx == nil {
+		opCtx = context.Background()
+	}
 	var cfg, companionConfig map[string]any
 	var err error
 	var bridgeAddress string
 	activeInterface := s.interfaceName
 	if req.Settings.Interface != "" {
 		activeInterface = req.Settings.Interface
+	}
+	if req.endpoint != nil && req.endpoint.Interface != "" {
+		activeInterface = req.endpoint.Interface
 	}
 	if isXHTTP(req.URI) {
 		if s.xray == "" {
@@ -152,6 +195,9 @@ func (s *service) connectRequest(req ConnectRequest) error {
 			targetHost := ""
 			if u != nil {
 				targetHost = u.Hostname()
+				if req.resolvedServer.IsValid() {
+					targetHost = req.resolvedServer.String()
+				}
 			}
 			detected, detErr := detectOutboundInterface(targetHost)
 			if detErr == nil && detected != "" {
@@ -168,7 +214,11 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		if e != nil {
 			return e
 		}
-		companionConfig, err = xrayConfig(req.URI, bridgeAddress, password, iface)
+		if req.resolvedServer.IsValid() {
+			companionConfig, err = xrayConfigPinned(req.URI, bridgeAddress, password, iface, req.resolvedServer)
+		} else {
+			companionConfig, err = xrayConfig(req.URI, bridgeAddress, password, iface)
+		}
 		if err != nil {
 			return err
 		}
@@ -179,7 +229,20 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		}
 		cfg, err = buildConfigWithOutbound(bridge, tun, s.interfaceName, req.Settings)
 	} else {
-		cfg, err = buildConfig(req.URI, tun, s.interfaceName, req.Settings)
+		if req.resolvedServer.IsValid() || req.endpoint != nil {
+			out, e := outbound(req.URI)
+			if e != nil {
+				return e
+			}
+			ip := req.resolvedServer
+			if !ip.IsValid() {
+				ip = req.endpoint.IP
+			}
+			pinOutboundServer(out, ip)
+			cfg, err = buildConfigWithOutbound(out, tun, activeInterface, req.Settings)
+		} else {
+			cfg, err = buildConfig(req.URI, tun, s.interfaceName, req.Settings)
+		}
 	}
 	if err != nil {
 		return err
@@ -221,7 +284,7 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		return err
 	}
 	defer os.Remove(candidate)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(opCtx, 8*time.Second)
 	defer cancel()
 	if err = exec.CommandContext(ctx, s.core, "check", "-c", candidate).Run(); err != nil {
 		return errors.New("sing-box отклонил конфигурацию; проверьте протокол, параметры и сборку ядра")
@@ -243,6 +306,9 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		if err = checkTUN(cfg); err != nil {
 			return err
 		}
+	}
+	if err := opCtx.Err(); err != nil {
+		return err
 	}
 	s.stopCore()
 	if s.tunCleanupErr != nil {
@@ -270,21 +336,29 @@ func (s *service) connectRequest(req ConnectRequest) error {
 			s.stopCore()
 		}
 	}()
-	if companionConfig != nil {
-		xrayPath := filepath.Join(s.dir, "xray.json")
-		if err = os.Rename(xrayCandidate, xrayPath); err != nil {
+	managedTUN := tun && runtime.GOOS == "linux"
+	startXray := func() error {
+		if err := opCtx.Err(); err != nil {
 			return err
 		}
-		s.xrayCmd, s.xrayDone, err = startCompanion(s.xray, xrayPath, bridgeAddress, &s.logs)
-		if err != nil {
+		xrayPath := filepath.Join(s.dir, "xray.json")
+		if err := os.Rename(xrayCandidate, xrayPath); err != nil {
+			return err
+		}
+		var startErr error
+		s.xrayCmd, s.xrayDone, startErr = startCompanionContext(opCtx, s.xray, xrayPath, bridgeAddress, &s.logs)
+		return startErr
+	}
+	if companionConfig != nil && !managedTUN {
+		if err = startXray(); err != nil {
 			return err
 		}
 	}
 	var done chan struct{}
-	if tun && runtime.GOOS == "linux" {
+	if managedTUN {
 		var life io.Closer
 		s.tunManaged = true
-		cmd, done, life, activeInterface, err = startManagedTUN(s.core, path, &s.logs)
+		cmd, done, life, activeInterface, err = startManagedTUNContext(opCtx, s.core, path, &s.logs)
 		if err != nil {
 			s.stopCore()
 			return errors.Join(err, s.tunCleanupErr)
@@ -310,11 +384,19 @@ func (s *service) connectRequest(req ConnectRequest) error {
 	}
 	s.cmd = cmd
 	s.done = done
+	if managedTUN && companionConfig != nil {
+		// A ready guardian has verified the physical route and installed F2 rules.
+		if err = startXray(); err != nil {
+			return err
+		}
+	}
 	select {
 	case <-done:
 		s.cmd = nil
 		s.state = "error"
 		return errors.New("Ядро завершилось при запуске; проверьте журнал, права TUN и занятость портов")
+	case <-opCtx.Done():
+		return opCtx.Err()
 	case <-time.After(500 * time.Millisecond):
 		if s.xrayCmd != nil {
 			select {
@@ -336,7 +418,16 @@ func (s *service) connectRequest(req ConnectRequest) error {
 		}
 		digest := sha256.Sum256([]byte(req.URI))
 		s.activeProfile = hex.EncodeToString(digest[:8])
+		if req.endpoint != nil {
+			s.endpoint = req.endpoint
+			s.endpoint.Interface = activeInterface
+			s.endpoint.InterfaceSignature, _ = endpointInterfaceSignature(activeInterface)
+		}
+		req.endpoint = nil
+		req.operationContext = nil
+		req.resolvedServer = netip.Addr{}
 		s.desired = &req
+		s.reconnectAt = time.Time{}
 		s.reconnectAttempts = 0
 		s.sampleAt = time.Time{}
 		s.uploadTotal = nil
@@ -369,21 +460,21 @@ func decodeBody(w http.ResponseWriter, r *http.Request, target any) error {
 	}
 	return nil
 }
-func (s *service) coreRequest(path string, target any) error {
-	if s.apiAddress == "" {
+func coreRequest(parent context.Context, address, secret, path string, target any) error {
+	if address == "" {
 		return errors.New("API ядра недоступен")
 	}
 	timeout := 10 * time.Second
 	if path == "/connections" {
 		timeout = 1500 * time.Millisecond
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+s.apiAddress+path, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+address+path, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+s.apiSecret)
+	req.Header.Set("Authorization", "Bearer "+secret)
 	client := http.Client{Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 9 * time.Second}, Timeout: 10 * time.Second}
 	defer client.CloseIdleConnections()
 	response, err := client.Do(req)
@@ -396,15 +487,25 @@ func (s *service) coreRequest(path string, target any) error {
 	}
 	return json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(target)
 }
-func (s *service) refreshStats() {
+func (s *service) refreshStats() { s.refreshStatsContext(context.Background()) }
+func (s *service) refreshStatsContext(ctx context.Context) {
+	s.mu.Lock()
 	if s.state != "running" || s.apiAddress == "" {
+		s.mu.Unlock()
 		return
 	}
+	address, secret := s.apiAddress, s.apiSecret
+	s.mu.Unlock()
 	var values struct {
 		Upload   int64 `json:"uploadTotal"`
 		Download int64 `json:"downloadTotal"`
 	}
-	if s.coreRequest("/connections", &values) != nil {
+	if coreRequest(ctx, address, secret, "/connections", &values) != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != "running" || s.apiSecret != secret {
 		return
 	}
 	now := time.Now()
@@ -422,17 +523,31 @@ func (s *service) refreshStats() {
 	s.downloadRate = &down
 	s.sampleAt = now
 }
-func (s *service) check() error {
+func (s *service) check() error { return s.checkContext(context.Background()) }
+func (s *service) checkContext(ctx context.Context) error {
+	s.mu.Lock()
 	if s.state != "running" {
+		s.mu.Unlock()
 		return errors.New("Сначала подключите сервер")
 	}
 	s.verified = false
 	s.latencyMs = nil
+	address, secret := s.apiAddress, s.apiSecret
+	s.mu.Unlock()
 	var result struct {
 		Delay int64 `json:"delay"`
 	}
-	if err := s.coreRequest("/proxies/proxy/delay?timeout=8000&url="+url.QueryEscape("https://example.com"), &result); err != nil {
-		return errors.New("Проверка HTTPS через выбранный сервер не прошла")
+	err := coreRequest(ctx, address, secret, "/proxies/proxy/delay?timeout=8000&url="+url.QueryEscape("https://example.com"), &result)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != "running" || s.apiSecret != secret {
+		return context.Canceled
+	}
+	defer s.publishStatusLocked()
+	if err != nil {
+		s.lastError = "Проверка HTTPS через выбранный сервер не прошла"
+		s.logs.add("error", s.lastError)
+		return errors.New(s.lastError)
 	}
 	s.verified = true
 	s.latencyMs = &result.Delay
@@ -468,6 +583,10 @@ func (s *service) inspectProcess() {
 	}
 }
 func (s *service) inspectInterface() {
+	// The endpoint observer retains protection and requests explicit reconnect.
+	if s.endpoint != nil {
+		return
+	}
 	if s.state != "running" || s.activeInterface == "" {
 		return
 	}
@@ -485,6 +604,23 @@ func (s *service) inspectInterface() {
 	s.reconnectAt = time.Now().Add(2 * time.Second)
 }
 func (s *service) monitor(ctx context.Context) {
+	s.ensureStatusCache()
+	observerCtx, stopObserver := context.WithCancel(ctx)
+	observerDone := make(chan struct{})
+	go func() {
+		defer close(observerDone)
+		timer := time.NewTicker(time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-observerCtx.Done():
+				return
+			case <-timer.C:
+				s.observeEndpoint(observerCtx)
+			}
+		}
+	}()
+	defer func() { stopObserver(); <-observerDone }()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -492,27 +628,43 @@ func (s *service) monitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			s.inspectProcess()
-			s.inspectInterface()
-			if s.cmd == nil && s.desired != nil && s.desired.Settings.Reconnect && !time.Now().Before(s.reconnectAt) && s.reconnectAttempts < 5 {
-				req := *s.desired
-				attempt := s.reconnectAttempts + 1
-				s.logs.add("info", "Повторный запуск сетевого ядра")
-				if err := s.connectRequest(req); err != nil {
-					s.lastError = err.Error()
-					s.state = "error"
-					s.reconnectAttempts = attempt
-					s.reconnectAt = time.Now().Add(time.Duration(1<<attempt) * time.Second)
-				}
-			}
-			s.refreshStats()
+		}
+		s.mu.Lock()
+		if ctx.Err() != nil {
 			s.mu.Unlock()
+			return
+		}
+		s.inspectProcess()
+		s.inspectInterface()
+		var retry *ConnectRequest
+		attempt, epoch := 0, uint64(0)
+		if s.cmd == nil && s.desired != nil && s.desired.Settings.Reconnect && !s.reconnectAt.IsZero() && !time.Now().Before(s.reconnectAt) && s.reconnectAttempts < 5 {
+			request := *s.desired
+			attempt = s.reconnectAttempts + 1
+			s.controlMu.Lock()
+			if !s.closing && s.controlCancel == nil {
+				retry = &request
+				epoch = s.controlGeneration
+			}
+			s.controlMu.Unlock()
+		}
+		if s.cmd != nil && s.state == "running" && time.Since(s.connectedAt) >= 30*time.Second {
+			s.reconnectAttempts = 0
+		}
+		s.publishStatusLocked()
+		s.mu.Unlock()
+		if retry != nil {
+			s.automaticReconnect(ctx, epoch, *retry, attempt)
+		} else {
+			s.refreshStatsContext(ctx)
 		}
 	}
 }
 func (s *service) status() map[string]any {
 	s.inspectProcess()
+	return s.statusView()
+}
+func (s *service) statusView() map[string]any {
 	mode := map[bool]string{true: "tun", false: "proxy"}[s.tun]
 	if s.desired != nil && s.desired.Settings.Mode != "" {
 		mode = s.desired.Settings.Mode
@@ -538,7 +690,11 @@ func (s *service) status() map[string]any {
 	case "error":
 		engineState = "error"
 	}
-	return map[string]any{"state": s.state, "error": s.lastError, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine, "engineState": engineState, "serviceMode": s.serviceMode}
+	message := s.lastError
+	if message == "" && s.endpoint != nil {
+		message = s.endpoint.Message
+	}
+	return map[string]any{"endpoint": s.endpoint.status(), "state": s.state, "error": message, "mode": mode, "proxy": fmt.Sprintf("127.0.0.1:%d", port), "connectedAt": at, "uptimeSeconds": uptime, "verified": s.verified, "latencyMs": s.latencyMs, "activeProfile": s.activeProfile, "uploadTotal": s.uploadTotal, "downloadTotal": s.downloadTotal, "uploadRate": s.uploadRate, "downloadRate": s.downloadRate, "tunAllowed": s.tun, "reconnectAttempts": s.reconnectAttempts, "xrayAvailable": s.xray != "", "engine": engine, "engineState": engineState, "serviceMode": s.serviceMode}
 }
 func probe(uri string) map[string]any {
 	probeURI := uri
@@ -594,41 +750,25 @@ func (s *service) handler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(probe(req.URI))
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.inspectProcess()
-	var err error
-	switch {
-	case r.Method == "GET" && r.URL.Path == "/v1/status":
-	case r.Method == "POST" && r.URL.Path == "/v1/connect":
-		var req ConnectRequest
-		err = decodeBody(w, r, &req)
-		if err == nil {
-			err = s.connectRequest(req)
-		}
-	case r.Method == "POST" && r.URL.Path == "/v1/disconnect":
-		err = s.stop()
-	case r.Method == "POST" && r.URL.Path == "/v1/reconnect":
-		if s.desired == nil {
-			err = errors.New("Нет последнего соединения")
-		} else {
-			err = s.connectRequest(*s.desired)
-		}
-	case r.Method == "POST" && r.URL.Path == "/v1/check":
-		err = s.check()
-	case r.Method == "POST" && r.URL.Path == "/v1/logs/clear":
-		s.logs.clear()
-	default:
-		w.WriteHeader(404)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Неизвестный метод API"})
+	if s.handleControl(w, r) {
 		return
 	}
-	if err != nil {
-		s.lastError = err.Error()
-		s.logs.add("error", err.Error())
-		w.WriteHeader(400)
+	if r.Method == "POST" && r.URL.Path == "/v1/check" {
+		s.ensureStatusCache()
+		if err := s.checkContext(r.Context()); err != nil {
+			s.writeControlError(w, err)
+		} else {
+			s.writeStatus(w)
+		}
+		return
 	}
-	_ = json.NewEncoder(w).Encode(s.status())
+	if r.Method == "POST" && r.URL.Path == "/v1/logs/clear" {
+		s.logs.clear()
+		s.writeStatus(w)
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "Неизвестный метод API"})
 }
 
 type daemonConfig struct {
@@ -763,14 +903,17 @@ func prepareDaemon(cfg daemonConfig) (*daemonRuntime, error) {
 func (d *daemonRuntime) serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go d.svc.monitor(ctx)
+	monitorDone := make(chan struct{})
+	go func() { defer close(monitorDone); d.svc.monitor(ctx) }()
 	go func() { <-ctx.Done(); _ = d.server.Close() }()
 	err := d.server.Serve(d.listener)
 	cancel()
+	d.svc.cancelControls()
 	d.svc.mu.Lock()
 	tunWasActive := d.svc.tunActive
 	stopErr := d.svc.stop()
 	d.svc.mu.Unlock()
+	<-monitorDone
 	cleanupNetworkState(tunWasActive)
 	_ = os.RemoveAll(d.dir)
 	if err != nil && err != http.ErrServerClosed {

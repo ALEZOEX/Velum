@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -73,6 +74,9 @@ func isXHTTP(raw string) bool {
 }
 
 func xrayConfig(raw, address, password, interfaceName string) (map[string]any, error) {
+	return xrayConfigPinned(raw, address, password, interfaceName, netip.Addr{})
+}
+func xrayConfigPinned(raw, address, password, interfaceName string, pin netip.Addr) (map[string]any, error) {
 	u, e := url.Parse(raw)
 	if e != nil || u.Scheme != "vless" {
 		return nil, errors.New("XHTTP поддерживается для VLESS-ссылок")
@@ -90,7 +94,9 @@ func xrayConfig(raw, address, password, interfaceName string) (map[string]any, e
 	if e != nil {
 		return nil, e
 	}
-	if e = resolveEndpoint(out); e != nil {
+	if pin.IsValid() {
+		pinOutboundServer(out, pin)
+	} else if e = resolveEndpoint(out); e != nil {
 		return nil, e
 	}
 	mode := q.Get("mode")
@@ -239,6 +245,9 @@ func stopProcess(cmd *exec.Cmd, done chan struct{}) {
 	}
 }
 func startCompanion(executable, path, address string, logs *logBuffer) (*exec.Cmd, chan struct{}, error) {
+	return startCompanionContext(context.Background(), executable, path, address, logs)
+}
+func startCompanionContext(ctx context.Context, executable, path, address string, logs *logBuffer) (*exec.Cmd, chan struct{}, error) {
 	cmd := exec.Command(executable, "run", "-config", path)
 	cmd.Stdout = logs
 	cmd.Stderr = logs
@@ -257,6 +266,9 @@ func startCompanion(executable, path, address string, logs *logBuffer) (*exec.Cm
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
+		case <-ctx.Done():
+			stopProcess(cmd, done)
+			return nil, nil, ctx.Err()
 		case <-done:
 			return nil, nil, errors.New("Xray завершился при запуске; проверьте журнал")
 		default:

@@ -11,7 +11,7 @@ trap 'rm -rf -- "$test_dir"' EXIT
 build_flags=()
 [[ ${VELUM_F2_RACE:-0} != 1 ]] || build_flags=(-race)
 (cd "$project_dir/daemon" && go build "${build_flags[@]}" -o "$test_dir/velumd" . && go test "${build_flags[@]}" -c -o "$test_dir/f2.test" .)
-cases=${VELUM_F2_CASES:-'wire_roundtrip normal_repeated_dual_stack concurrent_velum_starts foreign_rules_preexisting foreign_during_session partial_rule_failure lost_ack_partial_install eexist_never_adopts modified_identity_refuses_cleanup exclusive_duplicate_rejected corrupt_journal_refuses_cleanup unmarked_residual_not_adopted core_SIGKILL_reconnect guardian_and_core_SIGKILL_independent_recovery daemon_15 daemon_9 data_plane_dns_ipv4_ipv6'}
+cases=${VELUM_F2_CASES:-'wire_roundtrip normal_repeated_dual_stack endpoint_path_before_core_start_rollback concurrent_velum_starts foreign_rules_preexisting foreign_during_session partial_rule_failure lost_ack_partial_install eexist_never_adopts modified_identity_refuses_cleanup exclusive_duplicate_rejected corrupt_journal_refuses_cleanup unmarked_residual_not_adopted core_SIGKILL_reconnect guardian_and_core_SIGKILL_independent_recovery daemon_15 daemon_9 data_plane_dns_ipv4_ipv6'}
 for test_case in $cases; do
   unshare --user --map-root-user --mount --net --pid --fork --mount-proc --kill-child=KILL /bin/bash -c '
     set -euo pipefail

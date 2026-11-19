@@ -68,6 +68,39 @@ func runF2Cases(t *testing.T, core, daemon string, uplink *netlink.Dummy, baseli
 			assertF2Snapshot(t, baseline)
 		}
 	})
+	t.Run("endpoint_path_before_core_start_rollback", func(t *testing.T) {
+		s := newService()
+		defer s.stop()
+		s.core = filepath.Join(s.dir, "failing-core")
+		// Observe the real kernel from the first instruction of "run". Abort
+		// before readiness so the supervisor must roll back the entire plan.
+		const script = `#!/bin/sh
+set -eu
+if [ "$1" = check ]; then exit 0; fi
+ip -j -4 route get 192.0.2.2 uid 0 > "$3.root"
+ip -j -4 route get 192.0.2.2 uid 65534 > "$3.user"
+exit 42
+`
+		mustF2(t, os.WriteFile(s.core, []byte(script), 0700))
+		req := request(true)
+		req.URI = strings.Replace(req.URI, "192.0.2.1", "192.0.2.2", 1)
+		if err := s.connectRequest(req); err == nil {
+			t.Fatal("failed core reported a successful connection")
+		}
+		for suffix, want := range map[string]string{"root": uplink.Name, "user": "velum0"} {
+			data, err := os.ReadFile(filepath.Join(s.dir, "config.json."+suffix))
+			mustF2(t, err)
+			var routes []struct{ Dev string }
+			mustF2(t, json.Unmarshal(data, &routes))
+			if len(routes) != 1 || routes[0].Dev != want {
+				t.Fatalf("packet path for %s at core startup: got %s, want %s", suffix, data, want)
+			}
+		}
+		assertF2Snapshot(t, baseline)
+		if _, err := readF2Journal(); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed startup left a journal: %v", err)
+		}
+	})
 	t.Run("concurrent_velum_starts", func(t *testing.T) {
 		a, b := newService(), newService()
 		defer a.stop()

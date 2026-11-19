@@ -154,21 +154,18 @@ func superviseTUN(core, path string) (result error) {
 	in, _ := linuxTUNInbound(cfg)
 	route := cfg["route"].(map[string]any)
 	iface, _ := route["default_interface"].(string)
+	endpoint, e := tunPinnedEndpoint(in)
+	if e != nil {
+		return e
+	}
 	if iface == "" {
-		excluded, e := tunAddresses(in, "route_exclude_address")
-		if e != nil {
-			return e
-		}
-		if len(excluded) == 0 {
-			return errors.New("cannot determine physical outbound interface")
-		}
-		iface, e = detectOutboundInterface(excluded[0].Addr().String())
+		iface, e = detectOutboundInterface(endpoint.String())
 		if e != nil {
 			return e
 		}
 	}
-	if iface == "" || iface == "velum0" {
-		return errors.New("TUN outbound interface must be independent of velum0")
+	if e = validateEndpointPhysicalRoute(endpoint, iface); e != nil {
+		return e
 	}
 	route["default_interface"], route["auto_detect_interface"] = iface, false
 	b, e := json.Marshal(cfg)
@@ -197,6 +194,29 @@ func superviseTUN(core, path string) (result error) {
 			result = errors.Join(result, fmt.Errorf("TUN cleanup incomplete: %w", cleanup))
 		}
 	}()
+	journal.Objects, e = tunPlan(in, index, journal.Mark)
+	if e != nil {
+		return e
+	}
+	sources, e := tunUplinkSources(iface)
+	if e != nil {
+		return e
+	}
+	directRules, e := tunDirectReturnRules(cfg, sources, journal.Mark)
+	if e != nil {
+		return e
+	}
+	// Transport and direct-return rules precede ordinary application policy.
+	transportRules := tunEndpointTransportRules(endpoint, journal.Mark)
+	journal.Objects = append(append(transportRules, directRules...), journal.Objects...)
+	if e = lease.install(journal, tunMutate); e != nil {
+		return e
+	}
+	if e = ctx.Err(); e != nil {
+		return e
+	}
+	// No local mixed or bridge client can start a core transport before the
+	// pinned endpoint rule and all application routes are installed.
 	cmd = exec.Command(core, "run", "-c", path)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.ExtraFiles = []*os.File{tun, lease.lock} // FD4 keeps the lease if the supervisor is killed first.
@@ -211,23 +231,6 @@ func superviseTUN(core, path string) (result error) {
 		return e
 	}
 	if e = configureTUNDNS(index, in); e != nil {
-		return e
-	}
-	journal.Objects, e = tunPlan(in, index, journal.Mark)
-	if e != nil {
-		return e
-	}
-	sources, e := tunUplinkSources(iface)
-	if e != nil {
-		return e
-	}
-	directRules, e := tunDirectReturnRules(cfg, sources, journal.Mark)
-	if e != nil {
-		return e
-	}
-	// These disjoint source-scoped rules precede the ordinary TUN selectors.
-	journal.Objects = append(directRules, journal.Objects...)
-	if e = lease.install(journal, tunMutate); e != nil {
 		return e
 	}
 	report.Interface = iface
@@ -245,6 +248,9 @@ func superviseTUN(core, path string) (result error) {
 func unixCloseOnExec(fd int) { syscall.CloseOnExec(fd) }
 
 func startManagedTUN(core, path string, logs io.Writer) (*exec.Cmd, chan struct{}, io.Closer, string, error) {
+	return startManagedTUNContext(context.Background(), core, path, logs)
+}
+func startManagedTUNContext(ctx context.Context, core, path string, logs io.Writer) (*exec.Cmd, chan struct{}, io.Closer, string, error) {
 	executable, e := os.Executable()
 	if e != nil {
 		return nil, nil, nil, "", e
@@ -297,6 +303,10 @@ func startManagedTUN(core, path string, logs io.Writer) (*exec.Cmd, chan struct{
 		} else {
 			e = fmt.Errorf("TUN supervisor startup failed: %w", res.e)
 		}
+	case <-ctx.Done():
+		life.Close()
+		stopProcess(cmd, done)
+		e = ctx.Err()
 	case <-time.After(15 * time.Second):
 		life.Close()
 		stopProcess(cmd, done)
