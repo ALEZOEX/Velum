@@ -157,7 +157,7 @@ jobs:
               pacman -S --noconfirm clang cmake ninja pkgconf gtk3 curl unzip git which xz jq
 
           - distro: opensuse
-            container: opensuse/leap:latest
+            container: opensuse/leap:16.0
             setup_deps: |
               zypper install -y clang gcc-c++ cmake ninja pkgconf-pkg-config gtk3-devel curl unzip git xz jq which
 
